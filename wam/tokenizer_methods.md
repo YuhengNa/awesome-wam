@@ -27,7 +27,33 @@ L = feature_mse(x_hat_t, x_t)
 
 **缺点：** 单纯 channel adapter 的创新性较弱；动态信息不被显式建模；world model 仍需预测整帧 latent，静态背景 token 会占用大量容量。
 
-**当前代码状态：** 尚未实现 standalone S-VAE adapter。已有相关基础设施：
+**当前代码状态：已实现 standalone S-VAE adapter，并完成 SVG-P smoke。**
+
+- `external/openpi/src/openpi/models_pytorch/semantic_feature_vae.py`
+  - `SemanticFeatureVAEConfig`
+  - `SemanticFeatureVAE`
+  - 输入 `[B,V,N,D]`
+  - latent `[B,V,N,d]`
+  - 重建 `[B,V,N,D]`
+- `external/openpi/scripts/train_svae_libero.py`
+  - 复用 OpenPI LIBERO dataloader
+  - 复用 SVG-P / DINOv3 frozen teacher encode
+  - 对 clip feature `[B,V,F,N,D]` 展平帧轴为 `[B*F,V,N,D]` 训练逐帧 adapter
+
+**当前 smoke 结果：**
+
+- 数据：本地 `LIBERO_10 no-noops` LeRobot 数据
+- teacher：SVG-P
+- 视角：`base_0_rgb`
+- future deltas：`1,3,6,9`
+- batch size：8
+- steps：100
+- latent dim：96
+- 结果：loss 从 `0.4332` 降到 `0.0926`，recon 从 `0.3759` 降到 `0.0710`，无 NaN，梯度正常。
+
+这只说明训练链路跑通，不代表下游 action performance 结论。
+
+已有相关基础设施：
 
 - `external/openpi/src/openpi/models_pytorch/pi0_pytorch.py`: `encode_future_images_with_teacher()` 支持 raw SigLIP / raw DINOv3 future targets。
 - `external/openpi/src/openpi/training/config.py`: `pi05_libero_gen`, `pi05_libero_gen_dino`, `pi05_libero_gen_dino32`, `pi05_libero_gen_dino128` 是当前 pi0.5 generation-loss target 配置；其中 DINO32/128 是固定随机投影，不是可训练 S-VAE。
@@ -136,7 +162,7 @@ x_t + z_delta -> x_hat_{t+k}
 
 **缺点：** `z_delta` 不是完整状态，decode future 必须依赖上一帧 feature；多步 rollout 会有误差累积；single-token delta 可能不足以表示多物体、多区域变化，可能需要少量 delta tokens。
 
-**当前代码状态：部分原型，不是完整 DeltaTok。**
+**当前代码状态：已有正式 Delta tokenizer 原型，仍未接 action-conditioned predictor。**
 
 现有最接近的是 DreamDojo-style latent-action feature model：
 
@@ -156,11 +182,19 @@ x_t + z_delta -> x_hat_{t+k}
 - 当前 decoder 是把 latent 加到 current feature tokens 上重建 future，不包含 DeltaTok 的 staged tokenizer + world predictor 训练范式。
 - 当前没有 action-conditioned predictor 去预测 `z_delta`。
 
-**建议实现入口：**
+新增正式 Delta tokenizer 原型：
 
-- 新增 `external/openpi/src/openpi/models_pytorch/feature_delta_tokenizer.py`
-- 从 `FeatureLatentActionModel` 复用 pairwise feature loader 与 current-conditioned decoder 思路。
-- 先实现 deterministic delta tokenizer：
+- `external/openpi/src/openpi/models_pytorch/feature_delta_tokenizer.py`
+  - `FeatureDeltaTokenizerConfig`
+  - `FeatureDeltaTokenizer`
+  - deterministic transition tokenizer
+  - 支持 `M=1/4/8/...` 个 delta tokens
+- `external/openpi/scripts/train_deltatok_libero.py`
+  - 已切换到正式 `FeatureDeltaTokenizer`
+  - 支持 `--num-delta-tokens`
+  - 记录 `copy_mse`, `delta_ratio`, `z_norm`, `target_delta_norm`
+
+当前实现 contract：
 
 ```text
 encode(x_t, x_{t+k}) -> z_delta [B, M, d]
@@ -168,6 +202,12 @@ decode(x_t, z_delta) -> x_hat_{t+k}
 ```
 
 其中 `M` 可以先从 1 开始，再扩展到 4/8 个 delta tokens。
+
+尚未完成：
+
+- action-conditioned predictor：`history features + action chunk -> z_delta`
+- 与 S-VAE / PV-VAE 的同数据同 teacher 对比
+- LARY-style action probe
 
 ## 对比与建议
 

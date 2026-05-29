@@ -34,6 +34,7 @@ external/openpi/src/openpi/*
 !external/openpi/src/openpi/models_pytorch/
 external/openpi/src/openpi/models_pytorch/*
 !external/openpi/src/openpi/models_pytorch/delta_tokenizer.py
+!external/openpi/src/openpi/models_pytorch/feature_delta_tokenizer.py
 !external/openpi/src/openpi/models_pytorch/latent_action.py
 !external/openpi/src/openpi/models_pytorch/predictive_feature_vae.py
 !external/openpi/src/openpi/models_pytorch/semantic_feature_vae.py

@@ -2,8 +2,10 @@
 """Train a DeltaTok-style tokenizer on LIBERO feature pairs.
 
 This script reuses the existing LAM LIBERO data and SVG/DINO feature-teacher
-helpers, but trains a deterministic one-token transition autoencoder instead
-of a low-dimensional latent-action VAE.
+helpers, but trains a deterministic transition tokenizer:
+
+    encode(x_t, x_t+k) -> z_delta [B, M, d]
+    decode(x_t, z_delta) -> x_hat_t+k
 """
 
 from __future__ import annotations
@@ -20,8 +22,8 @@ import torch
 import torch.nn.functional as F
 import torch.nn.parallel
 
-from openpi.models_pytorch.delta_tokenizer import FeatureDeltaTokenizerConfig, FeatureDeltaTokenizerModel
 from openpi.models_pytorch.dinov3_vit import load_dinov3_patch_encoder
+from openpi.models_pytorch.feature_delta_tokenizer import FeatureDeltaTokenizer, FeatureDeltaTokenizerConfig
 
 import train_lam_libero as lam_utils
 
@@ -42,11 +44,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--model-dim", type=int, default=0, help="0 keeps model dim equal to feature dim.")
     parser.add_argument("--token-dim", type=int, default=0, help="0 keeps delta token dim equal to model dim.")
+    parser.add_argument("--num-delta-tokens", type=int, default=1, help="M in z_delta [B,M,d].")
     parser.add_argument("--encoder-layers", type=int, default=8)
     parser.add_argument("--decoder-layers", type=int, default=8)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--loss-fn", choices=("mse", "log_cosh", "smooth_l1"), default="log_cosh")
     parser.add_argument("--smooth-l1-beta", type=float, default=0.1)
+    parser.add_argument("--cosine-weight", type=float, default=0.0)
+    parser.add_argument("--decode-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--feature-normalization", choices=("token_layer_norm", "l2", "none"), default="none")
     parser.add_argument("--encoder-microbatch", type=int, default=64)
     parser.add_argument("--precision", choices=("bfloat16", "float32"), default="bfloat16")
@@ -152,12 +157,15 @@ def main() -> None:
         feature_dim=feature_dim,
         model_dim=model_dim,
         token_dim=args.token_dim,
+        num_delta_tokens=args.num_delta_tokens,
         num_encoder_layers=args.encoder_layers,
         num_decoder_layers=args.decoder_layers,
         num_heads=args.heads,
         max_views=max(4, len(views)),
+        decode_residual=args.decode_residual,
+        cosine_weight=args.cosine_weight,
     )
-    model = FeatureDeltaTokenizerModel(model_config).to(device)
+    model = FeatureDeltaTokenizer(model_config).to(device)
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -165,13 +173,15 @@ def main() -> None:
     if lam_utils.is_rank0():
         logging.info("DeltaTok config: %s", model_config)
         logging.info(
-            "teacher=%s views=%s stride=%d feature_dim=%d model_dim=%d token_dim=%d output_dir=%s",
+            "teacher=%s views=%s stride=%d feature_dim=%d model_dim=%d M=%d token_dim=%d residual=%s output_dir=%s",
             args.teacher,
             views,
             args.delta_stride,
             feature_dim,
             model_dim,
+            args.num_delta_tokens,
             model.module.token_dim if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model.token_dim,
+            args.decode_residual,
             output_dir,
         )
 
@@ -220,6 +230,15 @@ def main() -> None:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
             outputs = model(current_features, future_features)
             loss = feature_loss(outputs["pred"], future_features, args)
+            if args.cosine_weight > 0:
+                cosine_loss = 1.0 - F.cosine_similarity(
+                    outputs["pred"].float(),
+                    future_features.detach().float(),
+                    dim=-1,
+                ).mean()
+                loss = loss + args.cosine_weight * cosine_loss
+            else:
+                cosine_loss = outputs["pred"].new_tensor(0.0)
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
         optimizer.step()
@@ -235,13 +254,21 @@ def main() -> None:
                 target_delta = future_features.float() - current_features.float()
                 pred_delta = pred.float() - current_features.float()
                 delta_ratio = pred_delta.norm() / target_delta.norm().clamp_min(1e-6)
+                token_norm = outputs["z_delta"].float().norm(dim=-1).mean()
+                target_delta_norm = target_delta.norm(dim=-1).mean()
             logging.info(
-                "step=%d loss=%.6f mse=%.6f copy_mse=%.6f delta_ratio=%.3f grad=%.3f steps/s=%.3f",
+                (
+                    "step=%d loss=%.6f mse=%.6f cos=%.6f copy_mse=%.6f "
+                    "delta_ratio=%.3f z_norm=%.4f target_delta_norm=%.4f grad=%.3f steps/s=%.3f"
+                ),
                 step,
                 float(loss.detach().cpu()),
                 float(mse.detach().cpu()),
+                float(cosine_loss.detach().cpu()),
                 float(copy_mse.detach().cpu()),
                 float(delta_ratio.detach().cpu()),
+                float(token_norm.detach().cpu()),
+                float(target_delta_norm.detach().cpu()),
                 float(grad_norm.detach().cpu()),
                 steps_per_sec,
             )
