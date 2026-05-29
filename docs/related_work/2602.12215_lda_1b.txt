@@ -1,0 +1,2474 @@
+LDA-1B: Scaling Latent Dynamics Action Model
+via Universal Embodied Data Ingestion
+Jiangran Lyu∗1,2 , Kai Liu∗2,3,4 , Xuheng Zhang∗1,2 , Haoran Liao2,6 , Yusen Feng1,2 , Wenxuan Zhu1 , Tingrui Shen1 ,
+Jiayi Chen1,2 , Jiazhao Zhang1,2 , Yifei Dong1 , Wenbo Cui2,3,4 , Senmao Qi2 , Shuo Wang2 , Yixin Zheng2,3,4 , Mi Yan1,2 ,
+Xuesong Shi2 , Haoran Li3 , Dongbin Zhao3 , Ming-Yu Liu7 , Zhizheng Zhang2,† , Li Yi5,† , Yizhou Wang1,† , He Wang1,2,†
+1
+
+Peking University
+
+2
+
+Galbot
+
+3
+
+CASIA
+
+4
+
+BAAI
+
+5
+
+Tsinghua University
+
+arXiv:2602.12215v1 [cs.RO] 12 Feb 2026
+
+Code & Data: https://pku-epic.github.io/LDA
+
+∗
+
+Equal contribution
+
+6
+
+Sun Yat-sen University
+†
+
+7
+
+NVIDIA
+
+Corresponding authors
+
+Fig. 1: We introduce LDA-1B, a 1.6 B-parameter robot foundation model scaled on over 30k hours of heterogeneous embodied
+data. LDA-1B unifies policy, dynamics, and visual forecasting in a structured DINO [46] latent space, allowing different data
+sources to play complementary roles. Beyond high-quality data alone, noisy data and actionless videos also provide valuable
+visual and physical priors for dynamics learning. This universal data ingestion paradigm enables stable scaling with data and
+model size, significantly outperforming strong baselines such as π0.5 [23] across diverse manipulation tasks.
+Abstract—Recent robot foundation models largely rely on
+large-scale behavior cloning, which imitates expert actions but
+discards transferable dynamics knowledge embedded in heterogeneous embodied data. While the Unified World Model (UWM)
+formulation has the potential to leverage such diverse data,
+existing instantiations struggle to scale to foundation-level due
+to coarse data usage and fragmented datasets. We introduce
+LDA-1B, a robot foundation model that scales through universal
+embodied data ingestion by jointly learning dynamics, policy,
+and visual forecasting, assigning distinct roles to data of varying
+quality. To support this regime at scale, we assemble and
+standardize EI-30k, an embodied interaction dataset comprising
+over 30k hours of human and robot trajectories in a unified
+format. Scalable dynamics learning over such heterogeneous
+data is enabled by prediction in a structured DINO latent
+space, which avoids redundant pixel-space appearance modeling.
+Complementing this representation, LDA-1B employs a multimodal diffusion transformer to handle asynchronous vision and
+action streams, enabling stable training at the 1B-parameter
+scale. Experiments in simulation and the real world show LDA1B outperforms prior methods (e.g., π0.5 ) by up to 21%, 48%,
+and 23% on contact-rich, dexterous, and long-horizon tasks,
+respectively. Notably, LDA-1B enables data-efficient fine-tuning,
+gaining 10% by leveraging 30% low-quality trajectories typically
+harmful and discarded.
+
+I. I NTRODUCTION
+Inspired by the success of Large Language Models (LLMs)
+and Vision-Language Models (VLMs), the robotics community has increasingly pursued general-purpose robot foundation models through large-scale pretraining [5, 41]. Most existing approaches center on scaling behavior cloning (BC), which
+imitates expert actions but fundamentally restricts learning
+to high-quality demonstrations. Consequently, a large portion
+of heterogeneous embodied data [42] is discarded or only
+weakly utilized, despite containing rich physical interaction
+dynamics [26].
+Unified World Model (UWM) formulation [30, 60] provides
+an alternative by jointly optimizes dynamics, policy, and
+video generation within a single model, which can leverages
+not only expert data. Despite the potential value, existing
+UWM instantiations remain far from scaling to foundationlevel. A major limitation lies in coarse data usage: heterogeneous embodied data are often treated uniformly, without
+differentiating their roles by quality or supervision, which
+underutilizes transferable dynamics knowledge. In addition,
+the community lacks ready-to-use large-scale datasets that
+
+unify varying-quality data with consistent formats and aligned
+action representations. Furthermore, UWM represent future
+state in pixel space, entangling dynamics learning with redundant appearance modeling. Subtle variations in illumination,
+texture, background clutter, or camera viewpoint can dominate
+the training objective, making large-scale training inefficient
+and hindering the learning of interaction-relevant dynamics.
+To overcome these limitations, we introduce LDA-1B, a
+robot foundation model that scales via universal embodied
+data ingestion. In this framework, heterogeneous data play
+distinct yet complementary roles: actionless human videos
+supervise visual forecasting [38, 37, 25], lower-quality trajectories primarily inform dynamics learning, and high-quality
+trajectories support both policy and dynamics. To realize
+this approach at scale, we assemble EI-30k, a large-scale
+embodied interaction dataset with over 30k hours of human
+and robot trajectories across real and simulated environments,
+standardized in format and aligned in action representation.
+Scalable learning on such diverse data is facilitated by a
+structured DINO latent space [46, 59, 22], which reduces redundant appearance modeling [38, 25], and a multi-modal diffusion transformer that aligns asynchronous visual and action
+prediction. By combining this ingestion strategy, dataset, latent
+representation, and model architecture, LDA-1B achieves stable training at the 1B-parameter scale while maximizing data
+utilization.
+We evaluate LDA-1B on challenging RoboCasa-GR1
+benchmark and a diverse set of real-world tasks involving both
+grippers and high-DoF dexterous hands [56]. LDA-1B consistently outperforms π0.5 , achieving 21% gains on contact-rich
+manipulation, benefiting from improved dynamics understanding and 48% gains on dexterous manipulation, benefiting from
+effective utilization of human data. Moreover, under a mixedquality fine-tuning setting, LDA-1B improves data efficiency
+by 10% through leveraging low-quality trajectories that are
+detrimental to baseline methods. These results highlight universal embodied data ingestion and unified latent dynamics
+learning as a scalable alternative to behavior-cloning-centric
+robot pretraining. In summary, our contributions are threefold:
+• We propose LDA-1B, a scalable robot foundation model
+that learns generalizable interaction dynamics through
+unified latent dynamics pretraining.
+• We construct EI-30k, a large-scale embodied interaction dataset covering diverse embodiments, environments,
+data qualities, with aligned end effector coordinate system.
+• We demonstrate that LDA-1B achieves superior generalization and robustness across a wide range of settings, including simulation and real-world environments,
+contact-rich manipulation, dexterous manipulation, and
+long-horizon manipulation.
+II. R ELATED W ORK
+Robot Foundation Models. Recent robot foundation models predominantly adopt the Behavior Cloning paradigm. As
+summarized in Table I, representative approachesincluding
+
+Model
+
+Data Src. #Data Action Quality
+
+Train.
+
+Param.
+
+π0.5 [23]
+RDT [32]
+GraspVLA [14]
+InternVLA-M1 [11]
+Being-H0 [35]
+InternVLA-A1 [9]
+GR00T-N1.6 [40]
+UniVLA [7]
+
+Tele.
+Tele.
+Sim.
+Sim.
+Hum.
+Het.
+Het.
+Het.
+
+10k+
+<10k
+20k+
+<10k
+<10k
+10k+
+<10k
+<10k
+
+High
+High
+High
+High
+Mixed
+High
+Mixed
+Mixed
+
+BC
+BC
+BC
+BC
+Aln. + BC
+VF + BC
+LA + BC
+LA + BC
+
+3B
+1B
+2B
+3B
+14B
+3B
+1B
+7B
+
+LDA-1B
+
+Het.
+
+30k+
+
+Mixed
+
+UWM[60]
+
+1B
+
+TABLE I: Comparison of Representative Robot Foundation Models. This table compares the proposed LDA with
+recent robot foundation models in terms of data source,
+data quantity, action quality, training paradigm, and the
+number of trainable model parameters (excluding frozen
+components). Data source abbreviations are as follows:
+Tele.=teleoperation, Sim.=simulation, Hum.=human demonstration, and Het.=heterogeneous data. Training paradigm abbreviations include: BC=behavior cloning, VF=visual foresight, Aln.=alignment, LA=latent action modeling, and
+UWM=unified world model. Only embodied interaction data
+are considered, excluding internet-scale VQA data.
+
+π0 [4], RDT [32], and InternVLA [11]rely heavily on highquality teleoperation or simulation data, which fundamentally
+constrains their scalability. Hybrid methods such as BeingH0 [35] and UniVLA [7] attempt to incorporate heterogeneous
+data with mixed quality; however, they largely depend on
+action alignment or auxiliary pretrained latent action models,
+limiting the effective data scale to around 6k hour embodied
+data. In contrast, LDA-1B breaks this ceiling by adopting a
+unified world model formulation, enabling efficient ingestion
+of up to 30k hours of mixed-quality embodied data.
+Unified Video Action Models. Recent works have explored
+joint modeling dynamics and policy for embodied decision
+making. Methods such as DyWA [36], FLARE [58], and the
+WorldVLA series [10, 24] demonstrate that co-training nextstate prediction and policy learning can improve generalization
+in interactive environments. To enrich dynamics modeling,
+UWM [60] and UVA [30] further propose optimizing multiple
+objectives jointly, including video generation, forward and
+inverse dynamics, and action prediction. Concurrent with our
+work, Motus [3] adopt UWM paradigm and integrate priors
+from pretrained VLM and video generation models. Despite
+their promising results, these approaches typically operate
+directly in pixel space and do not explicitly consider the roles
+of data quality, scale, or heterogeneity during training, which
+limits their ability to fully exploit large-scale, mixed-quality
+interaction data for robust dynamics learning.
+Large-Scale Embodied Interaction Datasets. The progress
+in embodied ai relys on large-scale embodied datasets. Many
+widely used datasets are collected via teleoperation on real
+robots [4, 23, 27, 31] or generated in simulation [14, 11], providing high-quality action-labeled trajectories. Beyond robotcollected data, recent works explore human-centric embod-
+
+MM-DiT Block
+
+DINO Future
+
+Action Chunk
+
+FFN
+
+Conditioning Input
+
+FFN
+
+Obs
+
+VLM
+
+Language
+
+Sinusoidal
+Encoder
+
+Task
+Selection
+
+Forward Dynamics
+
++
+
+VLM Tokens
+
+Diffusion
+Timestep t
+
+Cross
+Attention
+
+𝑓*
+
+Task Embeddings
+
+Inverse Dynamics
+
+𝒐)
+
+𝒂
+
+Policy
+
+𝒂
+
+Multi-Modal
+Diffusion Transformer
+
++
+
+Visual Planning
+
+𝒐)
+
+𝒐
+
+𝒂
+
+𝒐
+
+𝒑(𝒂|𝒐, 𝒍)
+
+𝒐)
+
+𝒐
+
+𝒑(𝒐! |𝒐, 𝒍)
+
+Cross
+Attention
+
+LayerNorm
+
++
+
++
+
+Multi-Modal Self-Attention
+QKV
+
+𝒑(𝒂|𝒐, 𝒐! , 𝒍)
+
+KV
+
+Liner Projection
+
+Liner Projection
+
+𝒑(𝒐! |𝒐, 𝒂, 𝒍)
+
+VLM
+Tokens
+
+LayerNorm
+
+OR
+register
+
+OR
+register
+
++
+KV
+
+𝑻
+
+Time
+
+𝑻
+
+AdaLN
+AdaLN
+
+QKV
+Task & Time
+Embedding
+
+AdaLN
+
+𝒐
+noise
+
+dense/sparse sampling
+
+Current DINO+ noise
+
+xN
+
+Fig. 2: Architecture of LDA. LDA jointly denoises action chunks and future visual latent under multiple co-training objectives,
+including policy learning, forward dynamics, inverse dynamics, and visual forecasting. Conditioned on VLM tokens, diffusion
+timesteps, and task embeddings, the model adopts a multimodal diffusion transformer architecture, where action and visual
+experts are decoupled and interact through a shared self-attention layer.
+ied datasets, such as egocentric recordings with hand actions [53, 35]. While these datasets significantly expand data
+diversity, many are either not publicly released or provide
+limited action supervision, making them difficult to directly
+integrate with robot learning pipelines. More broadly, existing
+embodied datasets are highly fragmented: some are closedsource, others are open but vary substantially in data formats,
+sensor configurations, action representations, and annotation
+quality. This lack of standardization poses a major obstacle to
+large-scale data aggregation and unified training. In contrast,
+our work introduces EI-30k, a large-scale embodied interaction dataset that unifies diverse data sourcesincluding robot
+and human trajectories from both real-world and simulated
+environmentsunder consistent data formats and aligned action
+representations.
+III. L ATENT DYNAMICS ACTION M ODEL
+A. Preliminary: Unified World Models
+Given the current observation ot (typically an RGB image),
+UWM [60] jointly models multiple conditional distributions
+over future observations ot+1:t+k and action chunk at+1:t+k ,
+enabling unified learning of:
+1) Policy: p(at+1:t+k | ot )
+2) Forward Dynamics: p(ot+1:t+k | ot , at+1:t+k )
+3) Inverse Dynamics: p(at+1:t+k | ot:t+k )
+4) Visual Planning: p(ot+1:t+k | ot )
+Concretely, UWM [60] instantiates this framework using a
+joint diffusion model that predicts noise for both actions and
+future observations:
+
+(ϵθa , ϵθo ) = sθ o, ata , o′to , ta , to′ ,
+where ta and to are independently sampled diffusion timesteps
+for actions and observations, and ãta , õto denote their corresponding noisy inputs. The model is trained with a standard
+DDPM [20] objective, jointly denoising future actions and
+
+observations conditioned on ot . We further extend this formulation by introducing language ℓ conditioning through a VLM,
+enabling instruction-guided action and observation prediction.
+B. Universal Data Ingestion via Multi-task Co-training
+We adopt a universal data ingestion regime to jointly train
+the unified objectives described above, allowing heterogeneous
+embodied data to contribute according to their supervision
+quality. Specifically, high-quality robot and human demonstrations are co-trained with all objectives, supporting both
+action policy learning and dynamics modeling. Lower-quality
+trajectories, which may contain suboptimal or noisy actions,
+are used exclusively for dynamics and visual forecasting,
+where accurate action optimality is not required. In addition,
+we leverage large-scale human manipulation videos without
+action annotations to train the visual forecasting objective,
+providing supervision for instruction-conditioned future state
+prediction. This role-aware data usage prevents overfitting
+to expert-only behaviors and enables scalable learning of
+transferable dynamics and action representations.
+To implement differentiated objectives within a single diffusion model, we introduce four learnable task embeddings
+and two learnable register tokens. Each task embedding
+corresponds to a specific training objective (policy, forward
+dynamics, inverse dynamics, or visual forecasting) and is
+added to the diffusion timestep embedding ft to condition the
+denoising process. The learnable register tokensone for action
+and one for visual stateserve as placeholders for modalities
+that are absent in a given task. For example, during policy
+training, the model receives noisy action tokens along with
+a visual register token representing the unobserved future
+state; in contrast, visual forecasting uses noisy future visual
+tokens with an action register token. This design enables a
+unified architecture to flexibly support different inputoutput
+structures without modifying the network topology. Overall,
+
+the model predicts a denoising vector field vaθ under different
+task conditions and is trained using a flow-matching objective:
+θ
+laction
+= E(ot:t+k ,at+1:t+k ,ℓ)∼D vaθ − (ϵa − at+1:t+k )
+τa ∼U (0,Tτ )
+ϵa ∼N (0,I)
+θ
+lobs
+= E(ot:t+k ,at+1:t+k ,ℓ)∼D voθ − (ϵo − ot+1:t+k )
+
+lθ =
+
+τo ∼U (0,Tτ )
+ϵo ∼N (0,I)
+θ
+θ
+laction + lobs
+.
+
+2
+2
+2
+2
+
+,
+,
+
+(1)
+During training, action and visual losses are selectively
+activated according to the task specification, allowing heterogeneous data to contribute under appropriate supervision.
+At inference time, the same model can be flexibly invoked
+for different objectives by specifying the task embedding and
+corresponding inputs.
+C. Representation of Predictive Targets
+We represent predictive targetsfuture visual states and actionsin a unified format to maximize knowledge sharing across
+heterogeneous datasets. For visual prediction, we adopt latent
+features extracted from a pretrained DINO [46] encoder, rather
+than VAE-based pixel-space representations. DINO latents
+encode high-level semantic and spatial structure while suppressing background noise and low-level visual variations,
+which facilitates learning scene dynamics that generalize
+across diverse environments and object configurations.
+For actions, we define a unified hand-centric action space
+based on end-effector motion, consisting of delta wrist poses
+and finger configurations. For parallel-jaw grippers, the finger
+state is represented by a single degree-of-freedom gripper
+width, while for multi-finger dexterous hands, finger configurations are described using keypoints expressed in the wrist
+coordinate frame. This design enables consistent action modeling across different embodiments and manipulation platforms.
+To model temporal dynamics, visual states and actions are
+organized as two synchronized temporal streams with different
+sampling rates. Visual observations are sampled at 3hz, a
+lower frequency than actions, 10 hz. This reduces redundant
+computation from highly correlated consecutive frames while
+preserving fine-grained action dynamics, allowing the model
+to maintain coherent temporal alignment between fast-varying
+control signals and slower-evolving visual states.
+D. Architecture: MM-DiT
+We adopt a Multi-Modal Diffusion Transformer (MM-DiT)
+to jointly denoise action chunks and predict future visual
+features within a unified diffusion framework (Fig. 2). The
+model operates on heterogeneous tokens while sharing a common Transformer backbone. Conditioning inputs include the
+current observation, language instruction, diffusion timestep,
+and task specification. Observations and language are encoded
+by a pretrained VLM into conditioning tokens. The diffusion
+timestep is encoded using a sinusoidal embedding, and task
+information is represented by a learned task embedding. All
+
+conditioning signals are injected into each Transformer block
+via adaptive layer normalization (AdaLN [43]).
+Actions are organized as fixed-length chunks and corrupted
+with Gaussian noise. Future visual features (DINO [46] futures) are noised in parallel. Both modalities are projected
+into token embeddings through modality-specific linear layers
+and processed jointly by MM-DiT. Each MM-DiT block
+applies multi-modal self-attention over concatenated action
+and visual tokens, enabling cross-modal interaction. Modalityspecific QKV projections and FFNs are retained to preserve
+inductive biases, while attention is shared across modalities.
+Language tokens are incorporated via cross-attention to provide high-level semantic guidance. Finally, modality-specific
+output heads predict denoised action sequences and future
+visual features.
+E. Pre-training and Post-training
+Pre-training Configurations. Our model is trained on a
+server cluster equipped with 48 NVIDIA H800 GPUs. The
+training process contains 400k iterations, resulting in a total
+computational cost of 4,608 GPU hours. To preserve the
+generalization capability and visual representation quality of
+the pre-trained foundation models, we keep the parameters of
+the VLM [52] and the DINO [46] encoder frozen throughout
+the pre-training process, updating the MM-DiT and action
+encoder/decoder. This design ensures that the model can learn
+from new data without degrading the core abilities of the base
+models in cross-modal understanding and fine-grained visual
+feature extraction.
+Data-Efficient Finetuning. To adapt the model to target
+embodiments and tasks for real-world deployment, we introduce a lightweight post-training stage. This stage follows
+the same data regime as pretraining and effectively leverages naturally collected teleoperation data of mixed quality,
+without requiring expert-level demonstrations. Compared to
+prior finetuning pipelines that rely on carefully curated expert
+datasets, our method directly utilizes unfiltered teleoperation
+data, substantially improving data efficiency and reducing the
+cost of data collection and annotation, thereby facilitating
+practical deployment.
+IV. E MBODIED I NTERACTION DATASET (EI-30K)
+We introduce the Embodied Interaction Dataset (EI-30K),
+a large-scale collection of embodied interaction trajectories
+totaling over 30k hours. It consists of 8.03k hours of realworld robot data, 8.6k hours of simulated robot data, 7.2k
+hours of human demonstrations with actions, and 10k hours
+of actionless human videos. All subdatasets are annotated
+with explicit quality labels, enabling systematic analysis across
+different fidelity levels and supporting quality-aware learning.
+Data Unification. EI-30K consolidates datasets from heterogeneous platforms and tasks, which vary in storage formats,
+sensor modalities, and annotations. All data are converted
+into the LeRobot format, providing a unified representation of
+observations, actions, and language. This standardization facilitates plug-and-play training, flexible data composition, and
+
+Fig. 3: Aligned End Effector Coordinate Systems. We manually align coordinate frames across diverse robot and human
+embodiments to ensure consistency. This shared representation enables joint learning from heterogeneous interaction data.
+Model
+
+Fig. 4: Statistics of EI-30K. The dataset contains more than
+30k hours of diverse human and robot interaction data (right).
+It spans varying episode lengths (left) and a rich set of
+manipulation tasks (center).
+seamless integration of additional annotations, while greatly
+reducing engineering overhead for handling diverse sources.
+Aligned Action Representation. To support consistent modeling of physical interactions across embodiments, all available
+action annotations are expressed as hand-centric motion in a
+shared coordinate frame (Fig. 3). For robots, this includes the
+6-DoF end-effector pose plus gripper width or dexterous hand
+joints. For humans, the 6-DoF wrist pose and full MANO [45]
+hand parameters are recorded. Camera extrinsics are retained
+to decouple hand motion from egocentric head motion. All
+coordinate frames are manually aligned to ensure geometric
+consistency across datasets, enabling joint learning from both
+human and robot trajectories.
+Quality Annotation and Cleaning. EI-30K applies systematic
+cleaning and quality-aware annotation. Language annotations
+are normalized using a vision-language model to ensure
+semantic consistency. Motion segments without meaningful
+hand-object interaction are removed, e.g., head-only or idle
+segments in egocentric videos. Each trajectory is assigned a
+quality label based on action accuracy, and annotation completeness. Unlike aggressive filtering, low-quality trajectories
+are preserved, allowing downstream models to exploit the full
+spectrum of data through quality-aware training.
+V. E XPERIMENTS
+A. Simulation Experiments
+Benchmark and Baselines. We evaluate our method on
+RoboCasa-GR1 [39], a simulated kitchen benchmark featuring
+
+Vis. Rep. MMDiT
+
+VLM
+
+Success Rate ↑
+
+GR00T-N1.6[40]
+StarVLA[47]
+GR00T-EI30k
+
+-
+
+-
+
+Cosmos
+Qwen3vl[52]
+Qwen3vl
+
+47.6
+47.8
+51.3
+
+UWM-0.1B[60]
+UWM-1B
+UWM(MM-DiT)
+LDA(DiT)
+LDA-0.5B
+LDA-1B
+
+VAE
+VAE
+VAE
+DINO
+DINO
+DINO
+
+✗
+✗
+✓
+✗
+✓
+✓
+
+Qwen3vl
+Qwen3vl
+Qwen3vl
+Qwen3vl
+Qwen3vl
+
+14.2
+19.3
+20.0
+48.9
+50.7
+55.4
+
+TABLE II: Results on RoboCasa-GR1 [39] and impact of state
+representation (VAE vs. DINO [46])model size the MM-DiT
+architecture on task success rates.
+
+24 tabletop rearrangement and articulated-object manipulation
+tasks with the GR-1 humanoid robot and Fourier dexterous
+hands. The benchmark provides challenging and realistic
+settings that require high-DoF dexterous manipulation from
+egocentric RGB observations captured by a head-mounted
+camera. Following the GR00T [40] evaluation protocol, we
+finetune all models using 1,000 trajectories per task and evaluate each task with 51 trials, reporting average success rates. We
+compare LDA against GR00T and its strong variants, as well
+as UWM [60], under matched training paradigms and data.
+To ensure a fair comparison in terms of model capacity and
+pretraining, we reproduce a strong GR00T baseline (denoted as
+GR00T-EI10k) with 1B parameters, pretrained on our curated
+EI-30k high-quality subset and using Qwen3-VL as the VLM
+encoder.
+Comparison with Baselines. As shown in Table II, the original GR00T-N1.6 [40] with 3B parameters achieves a success
+rate of 47.6%. When pretrained on our curated EI-30k dataset,
+the reproduced GR00T-EI10k with 1B parameters shows a
+clear improvement, reaching 51.3%, highlighting the impact
+of high-quality embodied data. Under the same parameter
+budget, LDA further improves the success rate to 55.4%.
+These results indicate that, beyond data quality and parameter
+scaling, jointly learning actions and dynamics within a unified
+model provides additional gains when pretrained on mixedquality data.
+Ablation Study. We further analyze key design choices under
+identical training data and optimization settings. UWM [60],
+despite jointly predicting actions and dynamics, achieves only
+14.2% success due to limited model capacity and the use
+
+Use the tongs to put the cake on the plate
+
+Sweep the crumbs into the dustpan.
+
+Bimanually remove the lid.
+
+Wipe whiteboard.
+
+Pull the nail out using the claw hammer.
+
+Flip the box.
+
+Fig. 5: Real-World Manipulation Demonstrations Across Multiple Robotic Platforms and End-Effectors. Galbot G1 equipped
+with a Sharpa dexterous hand (top-left), Unitree G1 with a BrainCo dexterous hand (middle and bottom-left), and Galbot G1
+with a two-finger gripper (right).
+Pick & Place
+Success Rate (%)
+
+Fine Manipulation
+
+60.0
+50.0
+
+65.0
+
+60.0
+
+55.0
+
+52.0
+
+50.0
+
+40.0
+
+40.0
+
+Long-horizon Manipulation
+
+80.0
+
+72.0
+
+70.0
+
+60
+
+44.0
+
+40.0
+
+33.3
+
+40.0
+
+53.0
+35.0
+
+35.0
+
+20.0
+
+20
+0
+
+Contact-rich Manipulation
+
+80.0
+
+80
+
+40
+
+90.0
+
+Put the pepper into the box
+
+pick and handover and place
+
+Flip the box
+
+Wipe the board
+
+GR00T-N1.6
+
+Watering the flower Knock the specific block with hammer
+
+0.5
+
+Ours
+
+Sweep the table
+
+0.0 0.0
+Clean the rubbish
+
+Fig. 6: Success Rate Comparison on Real-World Gripper Manipulation Tasks. All models are few-shot fine-tuned on Galbot
+and evaluated on eight tasks spanning Pick & Place, Contact-rich, Fine, and Long-horizon manipulation. LDA consistently
+outperforms GR00T-N1.6 [40] and π0.5 [23].
+of entangled VAE latent representations. Scaling UWM to
+1B parameters or replacing its DiT backbone with our MMDiT yields only marginal improvements (19.3% and 20.0%,
+respectively), suggesting that architectural constraints fundamentally limit its performance. In contrast, replacing pixelspace VAE latents with DINO [46] representations leads to a
+substantial performance gain (20.0% → 55.4%), highlighting
+the importance of semantically structured latent spaces for
+effective scaling. Finally, removing the proposed MM-DiT
+architecture or reducing the model size to 0.5B parameters
+results in performance drops of 6.5% and 4.7%, respectively,
+confirming the effectiveness of the multi-expert design and its
+favorable scaling behavior.
+B. Real-world Experiments
+To validate the scalability and robustness of LDA-1B, we
+conduct extensive real-world experiments focusing on fewshot adaptation to new embodiments, dexterous manipulation,
+and data efficiency under mixed-quality supervision.
+Real-World Robot and Task Setup. We evaluate our method
+on two humanoid platforms: Galbot G1 and Unitree G1.
+Galbot G1 is equipped with either a two-finger gripper or
+
+22-DoF Sharpa dexterous hands, while Unitree G1 uses 10DoF BrainCo hands. Across all configurations, the policy
+receives only egocentric RGB observations from a headmounted camera. We evaluate four categories of manipulation
+tasks under the gripper setting, Pick and Place, Contactrich Manipulation, Fine Manipulation, and Long-horizon Manipulationcovering diverse contact dynamics and temporal
+horizons. Representative tasks include Beat Block, Flip Box,
+Handover, Pick-and-Place (Pepper), Sweep Table, Clean Rubbish, Water Flower, and Wipe Board. Dexterous manipulation
+further includes tool-use tasks such as pulling a nail with a
+hammer and flipping bread with a spatula, which require precise force control and coordinated finger motion. Qualitative
+demonstrations are shown in Fig. 5. For each task, we collect
+100 teleoperated trajectories without enforcing expert-level
+execution. As a result, the dataset naturally exhibits mixed
+quality: approximately 50–80% of trajectories correspond to
+expert behavior, while the remainder contain suboptimal actions such as pauses, retries, or inefficient motion patterns.
+Baselines and Finetuning Protocol. We compare LDA-1B
+against two strong baselines, π0.5 [23] and GR00T [40]. To
+ensure stable and competitive performance, baseline models
+
+High DoFs Hand
+
+100
+80
+
+100 100
+
+90
+
+Method
+π0.5
+Ours
+
+70
+
+60
+40
+
+0
+
+ad
+
+Pu
+ll
+
+Ma
+Op
+en
+
+Bre
+
+Na
+
+k
+cb
+
+oo
+
+ttle
+Bo
+Pic
+k
+
+il
+
+0
+
+GR00T-N1.6
+
+10
+
+0.5
+
+10 10
+
+ad
+
+20
+
+Bre
+
+20
+
+20
+
+Flip
+
+40
+
+40
+
+Ours
+
+Fig. 7: Success Rate Comparison on Real-World Dexterous
+Manipulation Tasks We evaluate the real-world performance
+of our model against baselines (GR00T-N1.6 and π0.5 ) on
+3 low DoFs hand (BrainCo) tasks and 2 high DoFs hand
+(Sharpa) tasks. Ours (dark blue) consistently outperforms
+baselines especially on fine dexterous task (pull nails) and
+high DoFs tasks.
+Pick & Place
+
+Method
+
+Object Background OOD Pos.
+π0.5
+GR00T
+Ours
+
+26.7
+40.0
+60.0
+
+20.0
+40.0
+60.0
+
+6.7
+20.0
+40.0
+
+TABLE III: Robust Generalization under visual and spatial
+perturbations. LDA-1B maintains 60.0% success across unseen objects, backgrounds, and OOD positions, demonstrating
+effective focus on task-critical affordances over visual noise
+through latent dynamics pretraining.
+
+are finetuned exclusively on the filtered expert subset. In
+contrast, LDA-1B leverages all collected trajectories and learns
+directly from the full mixed-quality distribution via our Universal Embodied Data Ingestion mechanism.
+Results on Gripper Manipulation. We first evaluate few-shot
+adaptation by deploying LDA-1B on the Galbot G1, which is
+excluded from our EI-30k pretraining dataset. As shown in
+Fig. 6, LDA-1B consistently outperforms all baselines across
+task categories. On simple pick-and-place tasks, LDA-1B
+achieves success rates of 80%–90%, indicating effective fewshot adaptation to a new robot embodiment. The performance
+gap widens substantially in contact-rich and long-horizon
+scenarios. For instance, the Clean the Rubbish task requires
+coordinated dual-arm manipulation, tool usage (dustpan), and
+sequential object transfer into a trash bin, where errors can
+easily accumulate over time. In this setting, LDA-1B achieves
+a 35% success rate, while both GR00T and π0.5 fail entirely
+(0%). This result suggests that latent dynamics modeling enables LDA to better anticipate action-induced state transitions,
+maintain temporal consistency, and recover from intermediate
+failures in extended manipulation sequences.
+Results on Dexterous Manipulation. We further evaluate
+LDA-1B on both low-DoF and high-DoF dexterous manipulation tasks, as reported in Fig. 7. On low-DoF tasks such
+as Pull Nail, which requires precise motion direction and
+
+Place the pen into the box
+
+Bimanually remove the lid
+
+63 High 63 High + 37 Low 66 High 66 High + 34 Low
+
+90
+
+80
+
+75
+
+Pic
+k
+
+Success Rate (%)
+
+Low DoFs Hand
+
+60
+70
+
+40 (20↓)
+80 (10↑)
+
+50
+50
+
+40 (10↓)
+60 (10 ↑)
+
+TABLE IV: Data-efficient mixed-quality finetuning. LDA1B improves success rates by +10% on both tasks when
+incorporating low-quality trajectories, while π0.5 degrades
+significantly, demonstrating effective utilization of noisy data
+for enhanced generalization.
+
+stable contact maintenance between the hammer and the nail,
+LDA-1B achieves 80% success, reliably localizing targets
+and adjusting sensitive actions, whereas π0.5 largely fails.
+On high-DoF tasks such as Flip Bread, which involve highdimensional control, continuous contact, and coordinated wrist
+motion, LDA-1B attains 90% success, while π0.5 reaches only
+10%. These results demonstrate that pretraining on large-scale
+human data provides strong latent priors for dexterous control,
+enabling precise finger coordination and object reorientation
+with limited robot data. In contrast, baseline policies struggle
+to generalize as action dimensionality and contact complexity
+increase.
+Generalization Ability. To evaluate the generalization of our
+policy, we test pick and place task under three conditions:
+novel objects, unseen backgrounds, and out-of-distribution
+(OOD) starting position, shown as Fig 8. As summarized in
+Table III, our model maintains high success rates despite visual
+and spatial perturbations. The large-scale latent dynamics
+pretraining allows the model to ignore visual distractors (background changes) while focusing on relevant object affordances,
+demonstrating strong generalization relative to baselines.
+Data-Efficient Finetuning. We analyze the value of mixedquality data ingestion during finetuning stage, by post-training
+on two splits: (1) High-Quality Only (expert data), and (2)
+High + Low Quality (all 100 trajectories). As shown in Table IV, while baseline models degrade when low-quality data
+is added, LDA-1B effectively leverages these noisy trajectories, boosting performance with 10%, substantially improving
+data efficiency and reducing the cost of data collection and
+annotation for practical deployment.
+C. Analysis of Scaling Effects
+To analyze the scaling behavior of LDA, we systematically
+vary model capacity, data composition, and training objectives.
+All models are evaluated on an unseen test set sampled from a
+held-out subset of Agibot World [6]. We report the action prediction L1 error as the primary metric, which serves as a stable
+and reproducible proxy for real-world performance. Fig. 10
+summarizes the results under four training configurations: (i)
+Policy Only, (ii) Policy + Visual Forecasting, (iii) Policy with
+Forward and Inverse Dynamics, and (iv) the full co-training
+framework (Ours). These experiments jointly reveal how LDA
+scales under heterogeneous supervision and increasing model
+capacity.
+
+Training
+
+OOD-Position
+
+Novel Objects
+
+Variant Background
+
+Fig. 8: Generalization evaluation setup on Pick and Place task
+
+Fig. 9: Visualization of latent forward dynamics. Our model generates accurate future visual representations (top) aligned
+with ground truth (bottom) across time steps, capturing semantic object structure and motion dynamics
+unstable behavior: while moderate scaling initially reduces
+error, incorporating lower-quality data leads to performance
+degradation. Similarly, partial co-training variants that exclude
+either dynamics or visual forecasting objectives (green and
+brown lines) improve robustness but fail to fully exploit the
+available data. In contrast, the full co-training framework (blue
+line) exhibits consistent improvement as additional heterogeneous data is introduced. Notably, even after all actionlabeled trajectories are exhausted, adding 10k actionless videos
+continues to reduce prediction error. These indicates that
+LDA can extract useful supervisory signals from low-qaulity
+data and non-action data through latent dynamics and visual
+forecasting, rather than treating such data as noise. Overall,
+these results demonstrate that Universal Data Ingestion is most
+effective when heterogeneous data and co-training objectives
+are scaled together, enabling LDA to fully utilize mixedquality supervision.
+
+Fig. 10: Scaling Analysis of LDA, evaluated by action prediction error on unseen test set. Top: Action prediction error
+decreases to 6.6 with 30k hours of training data, demonstrating
+effective utilization of diverse data sources. Bottom: LDA consistently outperforms UWM across model sizes (0.1B→1B)
+with increasing training data, while the baseline saturates
+rapidly.
+
+Effectiveness of Universal Data Ingestion. Effectively leveraging heterogeneous embodied data requires jointly scaling
+both data sources and training objectives. As shown in Fig. 10,
+LDA achieves its best performance only when all supervision signalspolicy learning, dynamics modeling, and visual
+forecastingare optimized together. When either the data scale
+or the training objectives are reduced, performance degrades
+noticeably. Using only action-labeled trajectories with a Policy
+Only objective (grey line), increasing the dataset size yields
+
+Effectiveness of Latent Representation. Although both LDA
+and UWM incorporate dynamics-related supervision, their
+scaling behaviors diverge substantially due to differences in
+the structure of their latent spaces. As shown in Fig. 10,
+UWM quickly saturates as data scale and model capacity
+increase, with additional supervision yielding diminishing or
+even negative returns. This indicates that simply increasing
+data or parameters is insufficient when the latent space cannot
+support compositional and causal reasoning. This limitation
+stems from UWM’s VAE-derived latent representation, which
+entangles appearance, geometry, and dynamics at a low-level
+feature granularity. Such entanglement restricts the models
+ability to factorize action-induced state transitions and prevents
+effective reuse of heterogeneous supervision during scaling.
+In contrast, LDA operates in a semantically structured latent space obtained from large-scale visual pretraining. This
+representation preserves object-level semantics and spatial
+coherence, enabling dynamics learning to scale smoothly with
+increased model capacity, richer training objectives, and more
+diverse datasets.
+
+surface where contact and force application are expected.
+Importantly, background clutter and visually salient but noninteractive regions are largely suppressed. These results indicate that LDA conditions visual attention on the physical
+consequences of actions, selectively focusing on regions that
+drive state transitions rather than static appearance.
+VI. C ONCLUSION , L IMITATION AND F UTURE D IRECTION
+
+Fig. 11: Attention Heat Map: ”Push Right”(top) highlights
+the mug’s leading edge and trajectory; ”Push Close”(bottom)
+concentrates on the contact surface. The model attends exclusively to movable regions while ignoring irrelevant background
+clutter.
+Effectiveness of Model Scaling. Beyond data scale, LDA
+exhibits consistent and predictable improvements as model
+capacity increases. As shown in Fig. 10, scaling the model
+from 0.1B to 0.5B and further to 1B parameters leads to
+monotonic reductions in action prediction error under the full
+co-training framework. This indicates that LDA can effectively
+absorb additional capacity to model increasingly complex
+actiondynamics relationships when sufficient heterogeneous
+supervision is available. The results highlight a promising
+scaling paradigm in which model capacity, training objectives,
+and heterogeneous embodied data are jointly aligned, enabling
+reliable performance gains.
+D. Analysis of Dynamics Learning
+Qualitative Analysis of Latent Forward Dynamics. Beyond
+quantitative prediction errors, we qualitatively examine the
+forward dynamics learned by LDA, visualized via PCA projections of DINO feature embeddings. As shown in Fig. 16,
+the model produces coherent future-state predictions that respect physical constraints such as object permanence, contact
+continuity, and motion consistency under the applied action.
+Notably, the predicted dynamics focus on task-relevant objects
+while remaining invariant to visual distractors that do not
+influence the control loop. This suggests that LDA learns a
+dynamics-aware latent world model, capturing how actions
+causally propagate through the scene rather than merely extrapolating visual appearance.
+Action-Conditioned Attention. To interpret how LDA reasons about action-induced state transitions, we visualize attention maps conditioned on different action primitives. As shown
+in Fig. 11, we compare the attention patterns induced by an
+active motion command (a1 ) with those under a static No-Op
+command (a2 ), and compute their difference to reveal actionspecific visual grounding. Across tasks, LDA consistently
+attends to regions that are causally relevant to the commanded
+interaction. In the Push Right scenario, the attention difference
+highlights the leading edge of the mug and the anticipated
+motion direction, reflecting awareness of object displacement.
+In the Push Close task, attention concentrates on the drawer
+
+We present LDA-1B, a robot foundation model that scales
+latent dynamics learning via universal embodied data ingestion. By assigning heterogeneous data distinct roles and leveraging over 30k hours of human and robot trajectories in the
+EI-30k dataset, LDA-1B learns dynamics in a structured DINO
+latent space and employs a mixed-frequency multimodal diffusion transformer, enabling stable training at the 1B-parameter
+scale. Experiments show strong performance across diverse
+manipulation and long-horizon tasks, as well as data-efficient
+fine-tuning on imperfect trajectories. Limitations include the
+reliance on fixed DINO visual features and predominantly
+egocentric camera viewpoints, which may constrain generalization to new visual perspectives and multi-modal signals.
+Future work includes jointly learning visual representations
+and latent dynamics, extending to richer sensory modalities,
+automatically optimizing data roles, and fostering broader
+community adoption of scalable, heterogeneous data-driven
+robot foundation models.
+ACKNOWLEDGMENTS
+We thank Caowei Meng for collecting teleoperation data;
+Haoran Liu and Jiayi Su for their assistance in early-stage
+exploration; Yu-Wei Chao and Shengliang Deng for fruitful discussions; and Junkai Zhao for providing experimental
+equipment.
+R EFERENCES
+[1] Build AI.
+Egocentric-10k, 2025.
+URL https://
+huggingface.co/datasets/builddotai/Egocentric-10K.
+[2] Prithviraj Banerjee, Sindi Shkodrani, Pierre Moulon,
+Shreyas Hampali, Shangchen Han, Fan Zhang, Linguang
+Zhang, Jade Fountain, Edward Miller, Selen Basol, et al.
+Hot3d: Hand and object tracking in 3d from egocentric
+multi-view videos. In Proceedings of the Computer
+Vision and Pattern Recognition Conference, pages 7061–
+7071, 2025.
+[3] Hongzhe Bi, Hengkai Tan, Shenghao Xie, Zeyuan
+Wang, Shuhe Huang, Haitian Liu, Ruowen Zhao, Yao
+Feng, Chendong Xiang, Yinze Rong, et al. Motus:
+A unified latent action world model. arXiv preprint
+arXiv:2512.13030, 2025.
+[4] Kevin Black, Noah Brown, Danny Driess, Adnan Esmail, Michael Equi, Chelsea Finn, Niccolo Fusai, Lachy
+Groom, Karol Hausman, Brian Ichter, et al. π0 : A visionlanguage-action flow model for general robot control.
+arXiv preprint arXiv:2410.24164, 2024.
+[5] Anthony Brohan, Noah Brown, Justice Carbajal, Yevgen Chebotar, Joseph Dabis, Chelsea Finn, Keerthana
+
+[6]
+
+[7]
+
+[8]
+
+[9]
+
+[10]
+
+[11]
+
+[12]
+
+Gopalakrishnan, Karol Hausman, Alex Herzog, Jasmine
+Hsu, et al. Rt-1: Robotics transformer for real-world
+control at scale. arXiv preprint arXiv:2212.06817, 2022.
+Qingwen Bu, Jisong Cai, Li Chen, Xiuqi Cui, Yan Ding,
+Siyuan Feng, Xindong He, Xu Huang, et al. Agibot
+world colosseo: A large-scale manipulation platform for
+scalable and intelligent embodied systems. In 2025
+IEEE/RSJ International Conference on Intelligent Robots
+and Systems (IROS). IEEE, 2025.
+Qingwen Bu, Yanting Yang, Jisong Cai, Shenyuan Gao,
+Guanghui Ren, Maoqing Yao, Ping Luo, and Hongyang
+Li. Univla: Learning to act anywhere with task-centric
+latent actions. arXiv preprint arXiv:2505.06111, 2025.
+Remi Cadene, Simon Alibert, Alexander Soare, Quentin
+Gallouedec, Adil Zouitine, Steven Palma, Pepijn
+Kooijmans, Michel Aractingi, Mustafa Shukor, Dana
+Aubakirova, Martino Russi, Francesco Capuano, Caroline Pascal, Jade Choghari, Jess Moss, and Thomas Wolf.
+Lerobot: State-of-the-art machine learning for real-world
+robotics in pytorch.
+https://github.com/huggingface/
+lerobot, 2024.
+Junhao Cai, Zetao Cai, Jiafei Cao, Yilun Chen, Zeyu
+He, Lei Jiang, Hang Li, Hengjie Li, Yang Li, Yufei Liu,
+et al. Internvla-a1: Unifying understanding, generation
+and action for robotic manipulation. arXiv preprint
+arXiv:2601.02456, 2026.
+Jun Cen, Chaohui Yu, Hangjie Yuan, Yuming Jiang,
+Siteng Huang, Jiayan Guo, Xin Li, Yibing Song, Hao
+Luo, Fan Wang, et al. Worldvla: Towards autoregressive
+action world model. arXiv preprint arXiv:2506.21539,
+2025.
+Xinyi Chen, Yilun Chen, Yanwei Fu, Ning Gao, Jiaya
+Jia, Weiyang Jin, Hao Li, Yao Mu, Jiangmiao Pang,
+Yu Qiao, et al. Internvla-m1: A spatially guided visionlanguage-action framework for generalist robot policy.
+arXiv preprint arXiv:2510.13778, 2025.
+Open X-Embodiment Collaboration, Abby O’Neill, Abdul Rehman, Abhinav Gupta, Abhiram Maddukuri, Abhishek Gupta, Abhishek Padalkar, Abraham Lee, Acorn
+Pooley, Agrim Gupta, Ajay Mandlekar, Ajinkya Jain,
+Albert Tung, Alex Bewley, Alex Herzog, Alex Irpan,
+Alexander Khazatsky, Anant Rai, Anchit Gupta, Andrew Wang, Andrey Kolobov, Anikait Singh, Animesh
+Garg, Aniruddha Kembhavi, Annie Xie, Anthony Brohan, Antonin Raffin, Archit Sharma, Arefeh Yavary,
+Arhan Jain, Ashwin Balakrishna, Ayzaan Wahid, Ben
+Burgess-Limerick, Beomjoon Kim, Bernhard Schlkopf,
+Blake Wulfe, Brian Ichter, Cewu Lu, Charles Xu, Charlotte Le, Chelsea Finn, Chen Wang, Chenfeng Xu, Cheng
+Chi, Chenguang Huang, Christine Chan, Christopher
+Agia, Chuer Pan, Chuyuan Fu, Coline Devin, Danfei
+Xu, Daniel Morton, Danny Driess, Daphne Chen, Deepak
+Pathak, Dhruv Shah, Dieter Bchler, Dinesh Jayaraman,
+Dmitry Kalashnikov, Dorsa Sadigh, Edward Johns, Ethan
+Foster, Fangchen Liu, Federico Ceola, Fei Xia, Feiyu
+Zhao, Felipe Vieira Frujeri, Freek Stulp, Gaoyue Zhou,
+
+Gaurav S. Sukhatme, Gautam Salhotra, Ge Yan, Gilbert
+Feng, Giulio Schiavi, Glen Berseth, Gregory Kahn,
+Guangwen Yang, Guanzhi Wang, Hao Su, Hao-Shu Fang,
+Haochen Shi, Henghui Bao, Heni Ben Amor, Henrik I Christensen, Hiroki Furuta, Homanga Bharadhwaj,
+Homer Walke, Hongjie Fang, Huy Ha, Igor Mordatch,
+Ilija Radosavovic, Isabel Leal, Jacky Liang, Jad AbouChakra, Jaehyung Kim, Jaimyn Drake, Jan Peters, Jan
+Schneider, Jasmine Hsu, Jay Vakil, Jeannette Bohg,
+Jeffrey Bingham, Jeffrey Wu, Jensen Gao, Jiaheng Hu,
+Jiajun Wu, Jialin Wu, Jiankai Sun, Jianlan Luo, Jiayuan
+Gu, Jie Tan, Jihoon Oh, Jimmy Wu, Jingpei Lu, Jingyun
+Yang, Jitendra Malik, Joo Silvrio, Joey Hejna, Jonathan
+Booher, Jonathan Tompson, Jonathan Yang, Jordi Salvador, Joseph J. Lim, Junhyek Han, Kaiyuan Wang,
+Kanishka Rao, Karl Pertsch, Karol Hausman, Keegan
+Go, Keerthana Gopalakrishnan, Ken Goldberg, Kendra
+Byrne, Kenneth Oslund, Kento Kawaharazuka, Kevin
+Black, Kevin Lin, Kevin Zhang, Kiana Ehsani, Kiran
+Lekkala, Kirsty Ellis, Krishan Rana, Krishnan Srinivasan,
+Kuan Fang, Kunal Pratap Singh, Kuo-Hao Zeng, Kyle
+Hatch, Kyle Hsu, Laurent Itti, Lawrence Yunliang Chen,
+Lerrel Pinto, Li Fei-Fei, Liam Tan, Linxi ”Jim” Fan, Lionel Ott, Lisa Lee, Luca Weihs, Magnum Chen, Marion
+Lepert, Marius Memmel, Masayoshi Tomizuka, Masha
+Itkina, Mateo Guaman Castro, Max Spero, Maximilian
+Du, Michael Ahn, Michael C. Yip, Mingtong Zhang,
+Mingyu Ding, Minho Heo, Mohan Kumar Srirama,
+Mohit Sharma, Moo Jin Kim, Muhammad Zubair Irshad, Naoaki Kanazawa, Nicklas Hansen, Nicolas Heess,
+Nikhil J Joshi, Niko Suenderhauf, Ning Liu, Norman Di
+Palo, Nur Muhammad Mahi Shafiullah, Oier Mees,
+Oliver Kroemer, Osbert Bastani, Pannag R Sanketi,
+Patrick ”Tree” Miller, Patrick Yin, Paul Wohlhart, Peng
+Xu, Peter David Fagan, Peter Mitrano, Pierre Sermanet,
+Pieter Abbeel, Priya Sundaresan, Qiuyu Chen, Quan
+Vuong, Rafael Rafailov, Ran Tian, Ria Doshi, Roberto
+Mart’in-Mart’in, Rohan Baijal, Rosario Scalise, Rose
+Hendrix, Roy Lin, Runjia Qian, Ruohan Zhang, Russell Mendonca, Rutav Shah, Ryan Hoque, Ryan Julian,
+Samuel Bustamante, Sean Kirmani, Sergey Levine, Shan
+Lin, Sherry Moore, Shikhar Bahl, Shivin Dass, Shubham
+Sonawani, Shubham Tulsiani, Shuran Song, Sichun Xu,
+Siddhant Haldar, Siddharth Karamcheti, Simeon Adebola, Simon Guist, Soroush Nasiriany, Stefan Schaal,
+Stefan Welker, Stephen Tian, Subramanian Ramamoorthy, Sudeep Dasari, Suneel Belkhale, Sungjae Park, Suraj
+Nair, Suvir Mirchandani, Takayuki Osa, Tanmay Gupta,
+Tatsuya Harada, Tatsuya Matsushima, Ted Xiao, Thomas
+Kollar, Tianhe Yu, Tianli Ding, Todor Davchev, Tony Z.
+Zhao, Travis Armstrong, Trevor Darrell, Trinity Chung,
+Vidhi Jain, Vikash Kumar, Vincent Vanhoucke, Vitor
+Guizilini, Wei Zhan, Wenxuan Zhou, Wolfram Burgard,
+Xi Chen, Xiangyu Chen, Xiaolong Wang, Xinghao Zhu,
+Xinyang Geng, Xiyuan Liu, Xu Liangwei, Xuanlin Li,
+Yansong Pang, Yao Lu, Yecheng Jason Ma, Yejin Kim,
+
+[13]
+
+[14]
+
+[15]
+
+[16]
+
+[17]
+
+[18]
+
+[19]
+
+[20]
+
+Yevgen Chebotar, Yifan Zhou, Yifeng Zhu, Yilin Wu,
+Ying Xu, Yixuan Wang, Yonatan Bisk, Yongqiang Dou,
+Yoonyoung Cho, Youngwoon Lee, Yuchen Cui, Yue Cao,
+Yueh-Hua Wu, Yujin Tang, Yuke Zhu, Yunchu Zhang,
+Yunfan Jiang, Yunshuang Li, Yunzhu Li, Yusuke Iwasawa, Yutaka Matsuo, Zehan Ma, Zhuo Xu, Zichen Jeff
+Cui, Zichen Zhang, Zipeng Fu, and Zipeng Lin. Open XEmbodiment: Robotic learning datasets and RT-X models. https://arxiv.org/abs/2310.08864, 2023.
+Dima Damen, Hazel Doughty, Giovanni Maria Farinella,
+Sanja Fidler, Antonino Furnari, Evangelos Kazakos, Davide Moltisanti, Jonathan Munro, Toby Perrett, Will
+Price, et al. The epic-kitchens dataset: Collection, challenges and baselines. IEEE Transactions on Pattern
+Analysis and Machine Intelligence, 43(11):4125–4141,
+2020.
+Shengliang Deng, Mi Yan, Songlin Wei, Haixin Ma,
+Yuxin Yang, Jiayi Chen, Zhiqi Zhang, Taoyu Yang,
+Xuheng Zhang, Wenhao Zhang, et al. Graspvla: a
+grasping foundation model pre-trained on billion-scale
+synthetic action data. arXiv preprint arXiv:2505.03233,
+2025.
+Zicong Fan, Omid Taheri, Dimitrios Tzionas,
+Muhammed Kocabas, Manuel Kaufmann, Michael J.
+Black, and Otmar Hilliges. ARCTIC: A dataset for
+dexterous bimanual hand-object manipulation.
+In
+Proceedings IEEE Conference on Computer Vision and
+Pattern Recognition (CVPR), 2023.
+Hao-Shu Fang, Hongjie Fang, Zhenyu Tang, Jirong Liu,
+Chenxi Wang, Junbo Wang, Haoyi Zhu, and Cewu Lu.
+Rh20t: A comprehensive robotic dataset for learning
+diverse skills in one-shot, 2023. URL https://arxiv.org/
+abs/2307.00595.
+Raghav Goyal, Samira Ebrahimi Kahou, Vincent Michalski, Joanna Materzynska, Susanne Westphal, Heuna Kim,
+Valentin Haenel, Ingo Fruend, Peter Yianilos, Moritz
+Mueller-Freitag, et al. The” something something” video
+database for learning and evaluating visual common
+sense. In Proceedings of the IEEE international conference on computer vision, pages 5842–5850, 2017.
+Kristen Grauman, Andrew Westbury, Eugene Byrne,
+Zachary Chavis, Antonino Furnari, Rohit Girdhar, Jackson Hamburger, Hao Jiang, Miao Liu, Xingyu Liu, et al.
+Ego4d: Around the world in 3,000 hours of egocentric
+video. In Proceedings of the IEEE/CVF conference on
+computer vision and pattern recognition, pages 18995–
+19012, 2022.
+Kristen Grauman, Andrew Westbury, Lorenzo Torresani,
+Kris Kitani, Jitendra Malik, Triantafyllos Afouras, Kumar
+Ashutosh, Vijay Baiyya, Siddhant Bansal, Bikram Boote,
+et al. Ego-exo4d: Understanding skilled human activity
+from first-and third-person perspectives. In Proceedings
+of the IEEE/CVF Conference on Computer Vision and
+Pattern Recognition, pages 19383–19400, 2024.
+Jonathan Ho, Ajay Jain, and Pieter Abbeel.
+Denoising diffusion probabilistic models. arXiv preprint
+
+arxiv:2006.11239, 2020.
+[21] Ryan Hoque, Peide Huang, David J Yoon, Mouli Sivapurapu, and Jian Zhang. Egodex: Learning dexterous
+manipulation from large-scale egocentric video. arXiv
+preprint arXiv:2505.11709, 2025.
+[22] Yuhang Huang, JIazhao Zhang, Shilong Zou, XInwang
+Liu, Ruizhen Hu, and Kai Xu. Ladi-wm: A latent
+diffusion-based world model for predictive manipulation.
+arXiv preprint arXiv:2505.11528, 2025.
+[23] Physical Intelligence, Kevin Black, Noah Brown, James
+Darpinian, Karan Dhabalia, Danny Driess, Adnan Esmail, Michael Equi, Chelsea Finn, Niccolo Fusai, et al.
+π0.5 : a vision-language-action model with open-world
+generalization. arXiv preprint arXiv:2504.16054, 2025.
+[24] Yuming Jiang, Siteng Huang, Shengke Xue, Yaxi Zhao,
+Jun Cen, Sicong Leng, Kehan Li, Jiayan Guo, Kexiang
+Wang, Mingxiu Chen, et al. Rynnvla-001: Using human
+demonstrations to improve robot manipulation. arXiv
+preprint arXiv:2509.15212, 2025.
+[25] Siddharth Karamcheti, Suraj Nair, Annie S Chen,
+Thomas Kollar, Chelsea Finn, Dorsa Sadigh, and Percy
+Liang.
+Language-driven representation learning for
+robotics. In Robotics: Science and Systems (RSS), 2023.
+[26] Alexander Khazatsky, Karl Pertsch, Suraj Nair, Ashwin Balakrishna, Sudeep Dasari, Siddharth Karamcheti, Soroush Nasiriany, Mohan Kumar Srirama,
+Lawrence Yunliang Chen, Kirsty Ellis, et al. Droid:
+A large-scale in-the-wild robot manipulation dataset.
+Robotics: Science and Systems (RSS), 2024.
+[27] Moo Jin Kim, Karl Pertsch, Siddharth Karamcheti, Ted
+Xiao, Ashwin Balakrishna, Suraj Nair, Rafael Rafailov,
+Ethan P Foster, Pannag R Sanketi, Quan Vuong, et al.
+Openvla: An open-source vision-language-action model.
+In Conference on Robot Learning, pages 2679–2713.
+PMLR, 2025.
+[28] LejuRobotics. Let:full-size humanoid robot real-world
+dataset.
+https://huggingface.co/datasets/LejuRobotics/
+let dataset, 2025.
+[29] Chengshu Li, Ruohan Zhang, Josiah Wong, Cem Gokmen, Sanjana Srivastava, Roberto Martn-Martn, Chen
+Wang, Gabrael Levine, Wensi Ai, Benjamin Martinez,
+Hang Yin, Michael Lingelbach, Minjune Hwang, Ayano
+Hiranaka, Sujay Garlanka, Arman Aydin, Sharon Lee,
+Jiankai Sun, Mona Anvari, Manasi Sharma, Dhruva
+Bansal, Samuel Hunter, Kyu-Young Kim, Alan Lou,
+Caleb R Matthews, Ivan Villa-Renteria, Jerry Huayang
+Tang, Claire Tang, Fei Xia, Yunzhu Li, Silvio Savarese,
+Hyowon Gweon, C. Karen Liu, Jiajun Wu, and Li FeiFei. Behavior-1k: A human-centered, embodied ai
+benchmark with 1,000 everyday activities and realistic
+simulation. arXiv preprint arXiv:2403.09227, 2024.
+[30] Shuang Li, Yihuai Gao, Dorsa Sadigh, and Shuran
+Song. Unified video action model. arXiv preprint
+arXiv:2503.00200, 2025.
+[31] Yue Liao, Pengfei Zhou, Siyuan Huang, Donglin Yang,
+Shengcong Chen, Yuxin Jiang, Yue Hu, Jingbin Cai,
+
+[32]
+
+[33]
+
+[34]
+
+[35]
+
+[36]
+
+[37]
+
+[38]
+
+[39]
+
+[40]
+
+[41]
+
+Si Liu, Jianlan Luo, et al. Genie envisioner: A unified world foundation platform for robotic manipulation.
+arXiv preprint arXiv:2508.05635, 2025.
+Songming Liu, Lingxuan Wu, Bangguo Li, Hengkai Tan,
+Huayu Chen, Zhengyi Wang, Ke Xu, Hang Su, and Jun
+Zhu. Rdt-1b: a diffusion foundation model for bimanual
+manipulation. arXiv preprint arXiv:2410.07864, 2024.
+Yun Liu, Haolin Yang, Xu Si, Ling Liu, Zipeng Li,
+Yuxiang Zhang, Yebin Liu, and Li Yi. Taco: Benchmarking generalizable bimanual tool-action-object understanding. In Proceedings of the IEEE/CVF Conference on
+Computer Vision and Pattern Recognition, pages 21740–
+21751, 2024.
+Yunze Liu, Yun Liu, Che Jiang, Kangbo Lyu, Weikang
+Wan, Hao Shen, Boqiang Liang, Zhoujie Fu, He Wang,
+and Li Yi. Hoi4d: A 4d egocentric dataset for categorylevel human-object interaction. In Proceedings of the
+IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 21013–21022, 2022.
+Hao Luo, Yicheng Feng, Wanpeng Zhang, Sipeng Zheng,
+Ye Wang, Haoqi Yuan, Jiazheng Liu, Chaoyi Xu, Qin Jin,
+and Zongqing Lu. Being-h0: vision-language-action pretraining from large-scale human videos. arXiv preprint
+arXiv:2507.15597, 2025.
+Jiangran Lyu, Ziming Li, Xuesong Shi, Chaoyi Xu,
+Yizhou Wang, and He Wang. Dywa: Dynamics-adaptive
+world action model for generalizable non-prehensile manipulation. arXiv preprint arXiv:2503.16806, 2025.
+Yecheng Jason Ma, Shagun Sodhani, Dinesh Jayaraman, Osbert Bastani, Vikash Kumar, and Amy Zhang.
+Vip: Towards universal visual reward and representation via value-implicit pre-training. arXiv preprint
+arXiv:2210.00030, 2022.
+Suraj Nair, Aravind Rajeswaran, Vikash Kumar, Chelsea
+Finn, and Abhinav Gupta. R3m: A universal visual
+representation for robot manipulation. In Conference on
+Robot Learning (CoRL). PMLR, 2022.
+Soroush Nasiriany, Abhiram Maddukuri, Lance Zhang,
+Adeet Parikh, Aaron Lo, Abhishek Joshi, Ajay Mandlekar, and Yuke Zhu. Robocasa: Large-scale simulation
+of everyday tasks for generalist robots. In Robotics:
+Science and Systems, 2024.
+NVIDIA,
+Johan
+Bjorck,
+Nikita
+Cherniadev
+Fernando Castaeda, Xingye Da, Runyu Ding, Linxi ”Jim”
+Fan, Yu Fang, Dieter Fox, Fengyuan Hu, Spencer Huang,
+Joel Jang, Zhenyu Jiang, Jan Kautz, Kaushil Kundalia,
+Lawrence Lao, Zhiqi Li, Zongyu Lin, Kevin Lin, Guilin
+Liu, Edith Llontop, Loic Magne, Ajay Mandlekar,
+Avnish Narayan, Soroush Nasiriany, Scott Reed,
+You Liang Tan, Guanzhi Wang, Zu Wang, Jing Wang,
+Qi Wang, Jiannan Xiang, Yuqi Xie, Yinzhen Xu, Zhenjia
+Xu, Seonghyeon Ye, Zhiding Yu, Ao Zhang, Hao Zhang,
+Yizhou Zhao, Ruijie Zheng, and Yuke Zhu. GR00T
+N1: An open foundation model for generalist humanoid
+robots. In ArXiv Preprint, March 2025.
+Octo Model Team, Dibya Ghosh, Homer Walke, Karl
+
+[42]
+
+[43]
+
+[44]
+
+[45]
+
+[46]
+
+[47]
+
+[48]
+
+[49]
+
+[50]
+
+[51]
+
+Pertsch, Kevin Black, Oier Mees, Sudeep Dasari, Joey
+Hejna, Charles Xu, Jianlan Luo, Tobias Kreiman, You
+Liang Tan, Lawrence Yunliang Chen, Pannag Sanketi,
+Quan Vuong, Ted Xiao, Dorsa Sadigh, Chelsea Finn, and
+Sergey Levine. Octo: An open-source generalist robot
+policy. In Proceedings of Robotics: Science and Systems,
+Delft, Netherlands, 2024.
+Abhishek Padalkar, Acorn Pooley, Ajinkya Jain, Alex
+Bewley, Alex Herzog, Alexander Irpan, Alexander Khazatsky, Anant Rai, Anikait Singh, Anthony Brohan, et al.
+Open x-embodiment: Robotic learning datasets and RT-X
+models. arXiv preprint arXiv:2310.08864, 2023.
+William Peebles and Saining Xie.
+Scalable diffusion models with transformers.
+arXiv preprint
+arXiv:2212.09748, 2022.
+Heqian Qiu, Zhaofeng Shi, Lanxiao Wang, Huiyu Xiong,
+Xiang Li, and Hongliang Li. Egome: Follow me via
+egocentric view in real world. arXiv e-prints, pages
+arXiv–2501, 2025.
+Javier Romero, Dimitrios Tzionas, and Michael J. Black.
+Embodied hands: Modeling and capturing hands and
+bodies together. ACM Transactions on Graphics, (Proc.
+SIGGRAPH Asia), 36(6), November 2017.
+Oriane Siméoni, Huy V. Vo, Maximilian Seitzer, Federico
+Baldassarre, Maxime Oquab, Cijo Jose, Vasil Khalidov, Marc Szafraniec, Seungeun Yi, Michaël Ramamonjisoa, Francisco Massa, Daniel Haziza, Luca Wehrstedt,
+Jianyuan Wang, Timothée Darcet, Théo Moutakanni,
+Leonel Sentana, Claire Roberts, Andrea Vedaldi, Jamie
+Tolan, John Brandt, Camille Couprie, Julien Mairal,
+Hervé Jégou, Patrick Labatut, and Piotr Bojanowski.
+DINOv3, 2025. URL https://arxiv.org/abs/2508.10104.
+starVLA Contributors. Starvla: A lego-like codebase for
+vision-language-action model developing. GitHub repository, 1 2025. URL https://github.com/starVLA/starVLA.
+Galaxea Team. Galaxea g0: Open-world dataset and dualsystem vla model. arXiv preprint arXiv:2509.00576v1,
+2025.
+Xin Wang, Taein Kwon, Mahdi Rad, Bowen Pan, Ishani
+Chakraborty, Sean Andrist, Dan Bohus, Ashley Feniello,
+Bugra Tekin, Felipe Vieira Frujeri, et al. Holoassist:
+an egocentric human interaction dataset for interactive
+ai assistants in the real world. In Proceedings of
+the IEEE/CVF International Conference on Computer
+Vision, pages 20270–20281, 2023.
+Kun Wu, Chengkai Hou, Jiaming Liu, Zhengping Che,
+Xiaozhu Ju, Zhuqin Yang, Meng Li, Yinuo Zhao,
+Zhiyuan Xu, Guang Yang, et al. Robomind: Benchmark
+on multi-embodiment intelligence normative data for
+robot manipulation. In Robotics: Science and Systems
+(RSS) 2025. Robotics: Science and Systems Foundation,
+2025. URL https://www.roboticsproceedings.org/rss21/
+p152.pdf.
+Shihan Wu, Xuecheng Liu, Shaoxuan Xie, Pengwei
+Wang, Xinghang Li, Bowen Yang, Zhe Li, Kai Zhu,
+Hongyu Wu, Yiheng Liu, et al. Robocoin: An open-
+
+[52]
+
+[53]
+
+[54]
+
+[55]
+
+[56]
+
+[57]
+
+[58]
+
+[59]
+
+[60]
+
+sourced bimanual robotic data collection for integrated
+manipulation. arXiv preprint arXiv:2511.17441, 2025.
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang,
+Binyuan Hui, Bo Zheng, Bowen Yu, Chang Gao, Chengen Huang, Chenxu Lv, Chujie Zheng, Dayiheng Liu,
+Fan Zhou, Fei Huang, Feng Hu, Hao Ge, Haoran Wei,
+Huan Lin, Jialong Tang, Jian Yang, Jianhong Tu, Jianwei
+Zhang, Jianxin Yang, Jiaxi Yang, Jing Zhou, Jingren
+Zhou, Junyang Lin, Kai Dang, Keqin Bao, Kexin Yang,
+Le Yu, Lianghao Deng, Mei Li, Mingfeng Xue, Mingze
+Li, Pei Zhang, Peng Wang, Qin Zhu, Rui Men, Ruize
+Gao, Shixuan Liu, Shuang Luo, Tianhao Li, Tianyi
+Tang, Wenbiao Yin, Xingzhang Ren, Xinyu Wang, Xinyu
+Zhang, Xuancheng Ren, Yang Fan, Yang Su, Yichang
+Zhang, Yinger Zhang, Yu Wan, Yuqiong Liu, Zekun
+Wang, Zeyu Cui, Zhenru Zhang, Zhipeng Zhou, and
+Zihan Qiu. Qwen3 technical report. arXiv preprint
+arXiv:2505.09388, 2025.
+Ruihan Yang, Qinxi Yu, Yecheng Wu, Rui Yan, Borui
+Li, An-Chieh Cheng, Xueyan Zou, Yunhao Fang, Xuxin
+Cheng, Ri-Zhao Qiu, et al. Egovla: Learning visionlanguage-action models from egocentric human videos.
+arXiv preprint arXiv:2507.12440, 2025.
+Xinyu Zhan, Lixin Yang, Yifei Zhao, Kangrui Mao,
+Hanlin Xu, Zenan Lin, Kailin Li, and Cewu Lu. Oakink2:
+A dataset of bimanual hands-object manipulation in complex task completion. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition,
+pages 445–456, 2024.
+Hongxiang Zhao, Xingchen Liu, Mutian Xu, Yiming
+Hao, Weikai Chen, and Xiaoguang Han. Taste-rob:
+Advancing video generation of task-oriented hand-object
+interaction for generalizable robotic manipulation. In
+Proceedings of the Computer Vision and Pattern Recognition Conference, pages 27683–27693, 2025.
+Tony Z Zhao, Vikash Kumar, Sergey Levine, and Chelsea
+Finn. Learning fine-grained bimanual manipulation with
+low-cost hardware. In Robotics: Science and Systems
+(RSS), 2023.
+Zhenyu Zhao, Hongyi Jing, Xiawei Liu, Jiageng Mao,
+Abha Jha, Hanwen Yang, Rong Xue, Sergey Zakharor,
+Vitor Guizilini, and Yue Wang. Humanoid everyday:
+A comprehensive robotic dataset for open-world humanoid manipulation, 2025. URL https://arxiv.org/abs/
+2510.08807.
+Ruijie Zheng, Jing Wang, Scott Reed, Johan Bjorck,
+Yu Fang, Fengyuan Hu, Joel Jang, Kaushil Kundalia,
+Zongyu Lin, Loic Magne, et al. Flare: Robot learning with implicit world modeling.
+arXiv preprint
+arXiv:2505.15659, 2025.
+Gaoyue Zhou, Hengkai Pan, Yann LeCun, and Lerrel
+Pinto. Dino-wm: World models on pre-trained visual features enable zero-shot planning. arXiv preprint
+arXiv:2411.04983, 2024.
+Chuning Zhu, Raymond Yu, Siyuan Feng, Benjamin
+Burchfiel, Paarth Shah, and Abhishek Gupta. Unified
+
+world models: Coupling video and action diffusion for
+pretraining on large robotic datasets. arXiv preprint
+arXiv:2504.02792, 2025.
+
+A PPENDIX A
+D ETAILS OF M ODEL
+We employ Qwen3-VL-4B-Instruct [52] as the joint language and vision encoder to extract high-level semantic representations. Visual observations are encoded using DINOv3ViT-s [46]. During pretraining, we freeze both the VLM and
+the DINOv3 image encoder to leverage the strong priors from
+the pretrained language and vision models while allowing
+the MM-DiT to be trained thoroughly on the downstream
+structure. In the subsequent finetuning stage, we unfreeze the
+VLM to enable end-to-end adaptation and further improve
+overall performance.
+Additionally, the MM-DiT is conditioned on a short history
+of two timesteps, comprising both past DINO-encoded observations and actions, to effectively capture temporal dynamics.
+Table V presents the detailed configurations of the model and
+the hyperparameters used during training.
+Parameter
+
+Value
+
+Model
+VLM
+Qwen3-VL [52]
+Observation Encoder DINOv3-ViT-s [46]
+Hidden Size
+1536
+Layers
+16
+Attention Heads
+32
+Image Shape
+(224, 224, 3)
+Latent Image Shape
+(14, 14, 384)
+Action Chunk
+16
+Training
+Batch Size
+Learning Rate
+Optimizer
+Weight Decay
+Betas
+Epsilon
+LR Schedule
+Min LR
+
+32 * 48 (pretraining)
+12 * 8 (finetuning)
+1e−4
+AdamW
+1e−5
+[0.9, 0.95]
+1e−8
+cosine w/ min lr
+5e−7
+
+TABLE V: Model and Training configuration hyperparameters
+A PPENDIX B
+D ETAILED R ESULTS ON THE S IMULATION B ENCHMARK
+A. Evaluation Setup and Model Description.
+All methods are evaluated on the full set of 24 RoboCasaGR1 [39] tasks, with 51 evaluation trials per task. Unless
+otherwise specified, models are finetuned using 1,000 demonstrations per task and optimized under the same training
+paradigm to isolate architectural differences.
+We summarize the evaluated models below:
+• UWM: A 140M-parameter Unified World Model [60],
+serving as a lightweight baseline.
+• UWM-XL: A 1B-parameter UWM variant equipped with
+Qwen3-VL [52] for joint language-vision encoding.
+• UWM+MM-DiT: UWM-L with its DiT backbone replaced by our MM-DiT architecture.
+• GR00T-N1.6 [40]: The original GR00T policy model
+without explicit dynamics modeling.
+
+•
+
+•
+
+•
+•
+
+StarVLA: A GR00T variant following StarVLA [47],
+replacing the original VLM with Qwen3-VL and trained
+from scratch on RoboCasa.
+GR00T-EI10k: A strong reproduced baseline pretrained
+on our EI-10k high-qaulity subset with Qwen3-VL, where
+VLM parameters are unfrozen during finetuning.
+LDA (DiT): An ablated version of LDA replacing MMDiT with a standard DiT backbone.
+LDA-1B: The full Latent Dynamics Action model with
+MM-DiT, designed to model action-induced state transitions in a structured latent space.
+
+B. Task-Level Results and Analysis.
+Table VI reports detailed per-task success rates. LDA consistently outperforms GR00T across contact-rich and cluttered
+rearrangement tasks, with particularly large gains in scenarios
+requiring precise placement and closing actions, such as PnP
+Bottle To Cabinet Close (76 % vs. 51.5%), PnP Can To Drawer
+Close (71% vs. 13%), and PnP Milk To Microwave Close
+(52% vs. 14%).
+As illustrated in Fig. 12, GR00T frequently fails due to a
+lack of anticipation of post-action consequences. For example,
+after placing an object inside a container, GR00T often retracts
+its arm along a trajectory that collides with the object, causing
+it to tip over. In contrast, LDA anticipates such interactions and
+generates trajectories that preserve object stability throughout
+the entire manipulation sequence.
+The largest improvements are observed in novel-object rearrangement tasks involving transfers across surfaces and containers (e.g., Cuttingboard → Basket/Cardboardbox, Placemat
+→ Plate/Tieredshelf, and Tray → Cardboardbox/Plate/Pot).
+These tasks require adaptive contact handling and trajectory
+correction under clutter, where LDA shows clear advantages.
+While GR00T remains competitive on a small subset of simple
+pick-and-place tasks with minimal environmental interaction,
+these cases are limited. Overall, LDAs higher average success
+rate (55.4 %vs. 47.6 %) reflects a systematic advantage in
+complex and contact-rich manipulation scenarios rather than
+isolated gains.
+A PPENDIX C
+D ETAILS REGARDING REAL - WORLD EXPERIMENT
+A. Real-world Setup.
+We conduct real-world experiments on two humanoid platforms: the Galbot G1 and the Unitree G1, as shown in
+Fig.13. The Galbot G1, with two 7-DoF arms, is equipped
+with two interchangeable end-effectors: two-finger paralleljaw grippers and 22-DoF SharpaWave dexterous hands. The
+Unitree G1 uses 10-DoF BrainCo hands. In all real-robot
+configurations, the policy receives visual input only from an
+egocentric head-mounted camera, providing a first-person view
+of the workspace.
+B. Task description and evaluation protocol.
+To validate the effectiveness of our method on physical
+systems, we evaluate eight representative manipulation tasks
+
+PnPBottleToCabinetClose
+
+𝑡
+
+𝑡
+
+Ours
+
+GR00T
+
+PnPMilkToMicrowaveClose
+
+𝑡
+
+𝑡
+
+Ours
+
+GR00T
+
+PnPCanToDrawerClose
+
+𝑡
+
+Ours
+
+GR00T
+
+Fig. 12: Qualitative comparison between our model and GR00T [40] on RoboCasa-GR1 [39] manipulation tasks. Three
+representative tasks demonstrate our model’s superior robustness in object grasping and placement accuracy. Critical failure
+modes of GR00T, including grasp slippage, misaligned object placement, and collision during manipulation, are highlighted
+with circles, while our model consistently achieves successful task completion.
+involving single-arm, dual-arm coordination, tool use, and
+contact-rich interactions. For object generalization, movable
+objects are randomized within predefined spatial regions while
+several supporting objects (e.g., baskets, dustpans, and trash
+bins) remain fixed to isolate task-specific manipulation challenges rather than compounding errors from initial grasp
+failures. All experiments are conducted in-domain, and each
+trial is terminated after 200 seconds if unsuccessful. Task
+success is defined using task-specific criteria such as successful object placement, execution of full procedural steps,
+or normalized scoring metrics for partial completion in longhorizon tasks. We evaluate each task over independent trials.
+The corresponding training data volume and success criteria
+for each task are summarized in Table VII.
+C. More Analysis.
+To validate the efficacy of our proposed approach, we
+conducted a comprehensive comparison against two baseline
+policies: GR00T-N1.6 [40] and π0.5 [23]. Our method (LDA)
+demonstrates superior performance across all four evaluated
+categories: Pick & Place, Contact-rich Manipulation, Fine
+Manipulation, and Long-horizon Manipulation.
+
+Performance on Basic Grasping Tasks. In standard Pick
+& Place scenarios, LDA achieves a dominant success rate,
+reaching 90.0% on the ”handover” task, significantly outperforming π0.5 [23] (70.0%) and nearly doubling the success rate
+of GR00T-N1.6 [40] (50.0%). This indicates that our policy
+has learned a more robust grasping primitive and achieve better
+few-shot adaptation on unseen Galbot robot, benefiting from
+larger-scale cross-embodiment learning.
+Robustness in Contact-Rich and Fine Manipulation.
+The advantages of LDA become increasingly pronounced in
+tasks requiring precise dynamic interaction. In Contact-rich
+Manipulation, such as ”flip the box,” LDA achieves a 60.0%
+success rate compared to just 20.0% for GR00T-N1.6 [40].
+This suggests that LDA effectively models the complex contact
+dynamics required to manipulate objects without slippage
+or instability, whereas the baselines likely struggle with the
+discontinuous nature of the contact forces. Similarly, in Fine
+Manipulation tasks like ”pouring,” which demand continuous
+closed-loop feedback, our method sustains an 80.0% success
+rate, surpassing the best baseline (π0.5 [23]) by 20 percentage
+points.
+
+model
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+PnP
+
+Bottle To Cabinet Close
+Can To Drawer Close
+Cup To Drawer Close
+Milk To Microwave Close
+Potato To Microwave Close
+Wine To Cabinet Close
+Novel From Cuttingboard To Basket
+Novel From Cuttingboard To Cardboardbox
+Novel From Cuttingboard To Pan
+Novel From Cuttingboard To Pot
+Novel From Cuttingboard To Tieredbasket
+Novel From Placemat To Basket
+Novel From Placemat To Bowl
+Novel From Placemat To Plate
+Novel From Placemat To Tieredshelf
+Novel From Plate To Bowl
+Novel From Plate To Cardboardbox
+Novel From Plate To Pan
+Novel From Plate To Plate
+Novel From Tray To Cardboardbox
+Novel From Tray To Plate
+Novel From Tray To Pot
+Novel From Tray To Tieredbasket
+Novel From Tray To Tieredshelf
+
+Average
+
+UWM UWM-XL UWM+MMDiT GR00T StarVLA GR00T-EI10k LDA(DiT) LDA
+27
+22
+18
+22
+16
+31
+8
+8
+24
+16
+10
+8
+12
+10
+2
+12
+2
+10
+22
+20
+12
+18
+6
+4
+
+41
+53
+12
+25
+29
+24
+18
+14
+20
+25
+10
+16
+10
+12
+2
+8
+10
+20
+27
+25
+18
+25
+16
+2
+
+49
+55
+43
+33
+18
+25
+10
+16
+27
+20
+6
+14
+14
+10
+2
+14
+8
+16
+25
+20
+16
+20
+16
+4
+
+51.5
+13
+8.5
+14
+41.5
+16.5
+58
+46.5
+68.5
+65
+46.5
+58.5
+57.5
+63
+28.5
+57
+43.5
+51
+78.7
+51.5
+71
+64.5
+57
+31.5
+
+46
+80
+54
+48
+28
+46
+48
+40
+68
+52
+56
+42
+44
+48
+18
+60
+50
+54
+70
+38
+56
+50
+36
+16
+
+69
+61
+47
+75
+41
+51
+43
+39
+67
+53
+29
+45
+55
+57
+20
+49
+61
+51
+67
+49
+57
+63
+55
+31
+
+65
+59
+40
+47
+39
+49
+55
+57
+65
+57
+39
+37
+53
+51
+22
+57
+43
+49
+59
+59
+57
+53
+39
+22
+
+76
+71
+41
+52
+41
+57
+65
+69
+75
+61
+51
+53
+55
+59
+24
+53
+43
+55
+61
+65
+63
+55
+51
+33
+
+14.3
+
+19.3
+
+20.0
+
+47.6
+
+47.8
+
+51.3
+
+48.9
+
+55.4
+
+TABLE VI: Results on RoboCasa-GR1 [39] benchmark. UWM-S: UWM [60] with 100M parameters. UWM-L: UWM with 1B
+parameters, using Qwen3-VL [52] as the joint encoder for language instructions and visual inputs. UWM-MMDiT: UWM-L
+with its DiT [43] backbone replaced by our MM-DiT architecture. QwenGR00T: GR00T [40] equipped with Qwen3-VL as
+its System 2 module. GR00T*: GR00T [40] pretrained on our dataset and equipped with Qwen3-VL as its System 2 module.
+LDA (DiT): Our LDA model with the MM-DiT replaced by a standard DiT. During finetuning on RoboCasa, the VLM is
+unfrozen to enable end-to-end adaptation.
+
+Capabilities in Long-Horizon Planning. The most striking
+distinction emerges in the Long-horizon Manipulation category. While baseline methods achieve moderate success on
+the relatively simple sweep the table task, they completely fail
+on the more complex throw rubbish task, registering a 0.0%
+success rate. In stark contrast, LDA achieves a 35.0% success
+rate, demonstrating robustness in multi-stage, temporally extended scenarios. This performance gap reveals a fundamental
+limitation of existing approaches: their inability to manage
+compounding errors over long action sequences due to a lack
+of explicit dynamics modeling. LDA’s success stems from its
+capacity to reason about the physical consequences of actions
+across time, maintain temporal consistency in latent states,
+and recover from intermediate deviationscapabilities that are
+essential for real-world, multi-step manipulation. Crucially,
+this advantage is rooted in LDAs dynamics-aware architecture,
+which aligns predicted visual features with underlying physical
+transitions and mitigates covariate shift through structured
+temporal modeling. Collectively, these results validate that
+explicitly modeling latent dynamics is not merely beneficial
+but necessary for reliable, generalizable robotic manipulation
+in complex, real-world settings.
+Capabilities in Dexterous Manipulation. LDA consistently outperforms baselines on both low-DoF and high-DoF
+hands, with the performance gap becoming more pronounced
+as task difficulty and dexterity requirements increase. For low-
+
+DoF hands, LDA already demonstrates strong robustness on
+tasks involving tool use and force-sensitive interactions. On
+Pick Bottle, LDA achieves a 90% success rate, substantially
+higher than π0.5 (20%) and GR00T-N1.6 (75%). On Pull Nail,
+which requires precise force direction and stable contact maintenance, LDA reaches 80% success, while π0.5 completely
+fails and GR00T-N1.6 achieves only 40%. Notably, all methods perform well on Open Macbook, suggesting that tasks with
+strong geometric affordances and limited contact ambiguity
+are less challenging even for baseline policies. The advantage
+of LDA becomes even more evident with high-DoF hands,
+where action spaces are larger and control errors accumulate
+more easily. On Pick Bread, LDA attains a 70% success rate,
+outperforming GR00T-N1.6 (20%) and π0.5 (10%). The gap
+further widens on Flip Bread, a highly dexterous task requiring
+coordinated finger motion and continuous contact reasoning,
+where LDA achieves 90% success while both baselines remain
+at only 10%. These results highlight LDAs superior ability for
+high-dimensional control and contact-rich dexterous manipulation. Unlike baseline methods that rely primarily on reactive
+policies, LDA benefits from dynamics-aware latent representations that capture fine-grained physical interactions over time.
+This enables more stable control, improved contact reasoning,
+and effective recovery from transient failurescapabilities that
+are critical for dexterous manipulation with complex, multiDoF robotic hands.
+
+Task Abbreviation
+
+Description
+
+Test Protocol
+
+Pick Vegetable
+
+Pick a plastic pepper and place it into a basket 10 trials; success if placed in basket
+using the left gripper. Pepper is randomized within
+a 15×30 cm region.
+
+Handover
+
+Left gripper grasps a bottle and passes it to the 10 trials; success if placed in basket
+right gripper, which places it into a basket. Bottle
+randomized within 15×30 cm.
+
+Wipe Board
+
+Use an eraser to remove marker writing from a 10 trials; scored from 0–5 based on
+whiteboard. Writing area randomized within 25×40 cleaning completeness
+cm.
+
+Flip Box
+
+Flip an upside-down storage box to upright us- 10 trials; success if fully flipped
+ing bimanual manipulation. Box randomized within
+2×4 cm.
+
+Water Flower (pouring)
+
+grasp a watering bottle and pour water into a flower 10 trials; success if pouring posture
+pot. Pot randomized within 15×15 cm.
+is achieved with spout above pot
+
+Knock the block with grasp a hammer with a very thin handle and 60 trials; only if both the grasp and
+hammer (pnp2)
+then knock the specific block. Hammer randomized knock succeed.
+within 15×15 cm.
+Sweep Table
+
+Sweep ten nails into a dustpan using a broom and 10 trials; success rate is computed as
+dustpan. Nail positions randomized within 10×25 the proportion of nails collected in the
+cm.
+dustpan.
+
+Throw Rubbish
+
+Pick paper balls, place them into a dustpan, and 10 trials; success rate is computed as
+dump them into a trash can. Paper balls are ran- the proportion of paper balls successdomized within a 20×25 cm area.
+fully dumped into the trash can.
+
+TABLE VII: Real-world gripper manipulation for Galbot task configurations. All tasks are evaluated in-domain with a timeout
+of 200 seconds per trial.
+
+Task
+Abbreviation
+
+Description
+
+Test Protocol
+
+Pick Bottle
+
+Pick up a plastic bottle and place it onto a fixed 20 trials; success if bottle is upright
+target region using the right hand. Bottle position and its base overlaps at least half of
+is randomized.
+the target region
+
+Open MacBook
+
+Left hand stabilizes the base while the right hand 20 trials; success if opening angle
+opens the hinge by pushing the upper edge. Initial exceeds 75% of maximum
+opening angle is randomized.
+
+Pull Nail
+
+Use a claw hammer held by the right hand to 10 trials; scored with partial credit:
+extract a nail from the surface. Hammer pose is 0.25 for locating, 0.5 for single-claw
+randomized.
+removal, 1.0 for full claw removal
+
+Pick Bread
+
+Pick a bread item and place it into a plate using the 10 trials; success if bread is placed
+right hand. Three bread types are used with equal into the plate
+distribution.
+
+Flip Bread
+
+Flip a long bread using a spatula held by the right 10 trials; 1.0 if flipped on first athand. Bread pose is randomized over a large region. tempt, 0.5 if second, 0 otherwise
+
+TABLE VIII: Dexterous hand manipulation tasks and evaluation protocols.
+
+Fig. 13: Real-world robot platforms used in our physical experiments. From left to right: (1) Galbot G1 equipped with a
+standard two-finger parallel gripper for basic grasping tasks; (2) Galbot G1 fitted with the SharpaWave dexterous hand (22
+DoF) for fine manipulation; (3) Unitree G1 mounted with the BrainCo dexterous hand (10 DoF) and a Zed Mini camera.
+This multi-platform setup demonstrates the generalization capability of our LDA model across diverse robot morphologies and
+end-effectors.
+A PPENDIX D
+D ETAILS OF EI-30 K .
+
+def __init__(self, dataset: str, eef_in_world:
+int, has_mano: bool):
+self.dataset = dataset
+self.eef_in_world = eef_in_world
+# 1 if wrist in world coordinates
+self.has_mano = has_mano
+self.eef_offset = {hand: np.eye(4) for hand
+in HAND_KEYS}
+self.eef_keys = HAND_KEYS
+
+A. Data Processing Pipeline for Robot and Human Datasets
+To ensure consistency and usability across heterogeneous
+robot and human datasets, we design a standardized data
+processing pipeline that converts raw recordings into a unified
+representation suitable for effective learning of both policy and
+dynamics. The pipeline consists of three main stages: dataset
+standardization, coordinate alignment and cleaning, and postprocessing for training.
+a) Dataset Standardization: All raw datasets are first
+converted into the common LeRobot [8] 2.1 format. This
+format includes:
+• End-effector poses: 6D position and orientation for both
+hands (human) or manipulators (robot);
+• Hand articulation: 21-point MANO keypoints for human hands (when available) and binary or continuous
+gripper states for robots;
+• Camera parameters: intrinsic and extrinsic matrices
+enabling reprojection across coordinate frames;
+• Task and temporal metadata: task identifiers, episode
+boundaries and timestamps.
+During this stage, all sequences are uniformly resampled to
+10 Hz, and structured metadata files are generated to preserve
+the alignment between frames and their semantic annotations,
+ensuring temporal coherence and task-aware data organization
+for downstream training.
+After standardization of LeRobot format, we implement
+an easy-to-use Dataset class for the following data process
+pipeline to harmonize heterogeneous action data across diverse
+datasets.
+class EmbodiedDataset:
+
+def get_wrist(self, df: pd.DataFrame) ->
+dict[str, np.ndarray]:
+pass
+def get_mano_or_gripper(self, df: pd.DataFrame):
+pass
+
+b) Coordinate Alignment and Data Cleaning: Human
+and robot datasets often employ inconsistent coordinate frame
+definitions. To unify them, particularly the end-effector (EEF)
+representations, we apply the following alignment and cleaning steps:
+•
+
+•
+
+•
+
+•
+
+End-effector coordinate alignment: For each dataset,
+we define a canonical EEF frame (e.g., at the wrist
+or gripper center). All recorded hand or manipulator
+poses are transformed into this common frame using a
+dataset-specific rigid offset, estimated through geometric
+inspection or visual validation.
+Camera motion decoupling: For sequences captured in
+a moving camera frame, hand trajectories are reprojected
+into a fixed world coordinate system to eliminate artifacts
+caused by camera motion.
+Keypoint standardization: Human hand poses without
+native MANO keypoints are converted into the standard
+21-point MANO representation, expressed relative to the
+aligned wrist frame.
+Data validation: Hand visibility is verified using an off-
+
+Fig. 14: Task descriptions for the Galbot G1 robot equipped with a standard two-finger parallel-jaw gripper, spanning four
+manipulation categories.
+the-shelf detector; frames with occluded, truncated, or
+kinematically invalid hand data are discarded to ensure
+annotation reliability.
+For robot datasets, we further normalize actuation signals:
+gripper widths are scaled to a consistent range (e.g., [0, 1]), and
+joint encodings are harmonized to match a unified kinematic
+convention.
+c) Data Cleaning: Textual annotations are unified into
+a structured format that explicitly describes the environmental
+context, per-hand actions (left/right), and high-level task objectives. When original annotations are inconsistent or missing,
+we leverage vision-language models to generate coherent, semantically aligned instructions. Finally, all processed datasets
+are organized by agent type (human or robot) and accompanied
+by comprehensive metadata files detailing task definitions,
+episode boundaries, and dataset statistics. This standardized
+pipeline ensures a consistent, interoperable data representation
+across domainsenabling robust, scalable training of dexterous
+manipulation policies that generalize across embodiment and
+task complexity.
+
+Data Type
+
+Open X-Embodiment [12]
+Agibot World [6]
+RoboMIND [50]
+Real-world Robot Humanoid Everyday [57]
+RoboCOIN [51]
+Galaxea [48]
+LET [28]
+
+Duration (h)
+3000
+3276
+305
+30
+500
+500
+1000
+
+Simulated Robot
+
+InternData-A1 [11]
+Behavior-1k [29]
+
+7433
+1200
+
+Ego Human
+(w/ Action)
+
+Ego4D [18]
+Epic-Kitchens [13]
+Ego-Exo4d [19]
+SSV2 [17]
+EgoDex [21]
+HOT3D [2]
+HoloAssist [49]
+OAKINK2 [54]
+TACO [33]
+HOI4D [34]
+ARCTIC [15]
+
+3670
+100
+1286
+240
+830
+16
+166
+6.5
+3.2
+7.6
+2.3
+
+Egocentric-10k [1]
+RH20T-human [16]
+Egome [44]
+Taste-Rob [55]
+
+10000
+100
+80
+130
+
+Total
+
+30k+
+
+B. Data Composition.
+Our training data spans four complementary categories,
+totaling more than 30,000 hours of egocentric experience:
+a) Real-world Robot Data : This category includes largescale physical robot execution logs. We primarily leverage
+Open X-Embodiment [12] and Agibot World [6] for generalpurpose manipulation. To enhance hardware-specific capabilities, we incorporate Humanoid Everyday [57] for bipedal locomotion dynamics and Galaxea [48] for high-fidelity dexterous
+tasks. Additionally, we include RoboCOIN [51] despite its
+
+Source / Sub-dataset
+
+Ego Human
+(Actionless)
+
+TABLE IX: Composition of the Embodied Interaction Dataset
+(EI-30K). The dataset is categorized into four main types,
+aggregating over 30k hours of data.
+
+Fig. 16: DINO Feature Prediction Visualization. Left column:
+Original RGB input images. Middle column: Ground-truth
+DINO features extracted by DINOv3 [46]. Right column:
+DINO features predicted by our model.
+these trajectories lack explicit action labels, they provide a
+powerful self-supervised signal for learning world dynamics,
+visual affordances, and temporal structure.
+A PPENDIX E
+D ETAILS OF OTHER E XPERIMENTS
+Fig. 15: Dexterous manipulation task description across two
+robotic platforms. Top three rows: Unitree robot equipped
+with BrainCo hands performing bottle placement, MacBook
+opening, and nail extraction. Bottom two rows: Galbot robot
+utilizing SharpaWave hands executing bread placement and
+flipping tasks.
+noisier action labels, as it provides valuable diverse environment explorations.
+b) Simulated Robot Data: To provide dense, noise-free
+supervision, we use high-quality simulated trajectories. The
+majority comes from InternData-A1 [11], which offers largescale automated generation of locomotion and basic manipulation sequences. Behavior-1k [29] further contributes longhorizon task demonstrations in simulated household environments, enabling the model to learn complex task hierarchies.
+c) Egocentric Human Data with Actions: This subset bridges human intent and robot-executable actions. We
+draw from large-scale datasets such as Ego4D [18] , EpicKitchens [13] , Ego-Exo4d [19] and SSV2 [17] focusing
+on object-interaction segments. High-precision sources like
+EgoDex [21] and HOT3D [2] provide fine-grained 3D hand
+poses and contact information, critical for learning extrinsic
+dexterity.
+d) Egocentric Human Data without Actions: Representing the largest source of visual diversity, this category consists
+of first-person observations. Egocentric-10k [1] serves as the
+primary source, covering a broad spectrum of daily activities. Additional datasets like RH20T-human [16] and TasteRob [55] contribute domain-specific visual priors. Although
+
+A. Action-Conditioned Attention Visualization.
+We provide additional details on how action-conditioned
+attention maps are computed and interpreted. Our visualization
+is based on the Diffusion Transformer (DiT) [43] backbone,
+where visual tokens and action embeddings interact through
+shared self-attention layers.
+For a given observation, we extract attention maps from
+the middle transformer blocks, where high-level semantic and
+geometric information is most prominent. Conditioned on an
+active action primitive (e.g., “Push Right”), we compute the
+attention weights A1 , which quantify the influence of each
+spatial token on the predicted latent transition. To establish a
+reference, we generate a baseline attention map A2 by replacing the action embedding with a No-Op (static) command.
+We then compute the absolute difference:
+∆A = |A1 − A2 |,
+which isolates attention changes induced purely by the action
+condition. This subtraction effectively removes generic visual
+saliency (e.g., high-contrast edges or background objects) and
+highlights regions whose relevance emerges only when a
+specific action is applied.
+As illustrated in Fig. 11, the resulting difference maps consistently emphasize contact regions, force application points,
+and anticipated motion trajectories. For example, in the “Push
+Right” task, attention shifts toward the gripperobject contact
+interface and the direction of expected displacement. This
+behavior demonstrates that the DiT dynamically re-weights
+visual tokens based on the physics implied by the action, rather
+than passively encoding static appearance.
+
+B. Visualization of Latent Forward Dynamics
+We provide additional qualitative visualizations to illustrate
+the forward dynamics learned by LDA. These qualitative
+results complement the quantitative analysis and provide further evidence that LDA learns structured, dynamics-aware
+latent representations suitable for long-horizon reasoning and
+control.
+
+
