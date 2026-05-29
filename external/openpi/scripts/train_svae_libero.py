@@ -18,11 +18,17 @@ import dataclasses
 import json
 import logging
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
 import torch
 import torch.nn.parallel
+
+# Allow running this script from the outer monorepo without installing openpi.
+_OPENPI_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_OPENPI_SRC) not in sys.path:
+    sys.path.insert(0, str(_OPENPI_SRC))
 
 from openpi.models_pytorch.dinov3_vit import load_dinov3_patch_encoder
 from openpi.models_pytorch.semantic_feature_vae import SemanticFeatureVAE, SemanticFeatureVAEConfig
