@@ -16,6 +16,7 @@ wandb/
 
 tmp_*
 
+<<<<<<< HEAD
 # Keep the full external tree ignored by default, but allow the small set of
 # OpenPI/FastWAM experiment files that this repo owns and reviews.
 external/*
@@ -37,3 +38,5 @@ external/openpi/src/openpi/models_pytorch/*
 !external/openpi/src/openpi/models_pytorch/latent_action.py
 !external/openpi/src/openpi/models_pytorch/predictive_feature_vae.py
 !external/openpi/src/openpi/models_pytorch/semantic_feature_vae.py
+=======
+>>>>>>> new
