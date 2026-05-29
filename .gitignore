@@ -15,4 +15,25 @@ wandb/
 *.safetensors
 
 tmp_*
-external/
+
+# Keep the full external tree ignored by default, but allow the small set of
+# OpenPI/FastWAM experiment files that this repo owns and reviews.
+external/*
+!external/openpi/
+external/openpi/*
+!external/openpi/scripts/
+external/openpi/scripts/*
+!external/openpi/scripts/train_deltatok_libero.py
+!external/openpi/scripts/train_lam_libero.py
+!external/openpi/scripts/train_predictive_feature_vae_libero.py
+!external/openpi/scripts/train_svae_libero.py
+!external/openpi/src/
+external/openpi/src/*
+!external/openpi/src/openpi/
+external/openpi/src/openpi/*
+!external/openpi/src/openpi/models_pytorch/
+external/openpi/src/openpi/models_pytorch/*
+!external/openpi/src/openpi/models_pytorch/delta_tokenizer.py
+!external/openpi/src/openpi/models_pytorch/latent_action.py
+!external/openpi/src/openpi/models_pytorch/predictive_feature_vae.py
+!external/openpi/src/openpi/models_pytorch/semantic_feature_vae.py
