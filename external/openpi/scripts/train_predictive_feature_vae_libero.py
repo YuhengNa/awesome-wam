@@ -252,6 +252,43 @@ def pca_feature_clip_images(
     return images[0], images[1]
 
 
+def scalar_grid_to_heatmap(values: torch.Tensor, *, size: int, max_value: float | None = None) -> Image.Image:
+    values = values.detach().float().cpu()
+    grid = int(values.numel() ** 0.5)
+    if grid * grid != values.numel():
+        raise ValueError(f"Expected square token grid, got {values.numel()} tokens.")
+    if max_value is None:
+        max_value = float(values.max().clamp_min(1e-6))
+    arr = (values.reshape(grid, grid) / max(max_value, 1e-6)).clamp(0.0, 1.0).numpy()
+    heat = np.zeros((grid, grid, 3), dtype=np.float32)
+    heat[..., 0] = arr
+    heat[..., 1] = np.sqrt(arr) * 0.35
+    heat[..., 2] = 1.0 - arr
+    return Image.fromarray((heat * 255.0).astype(np.uint8)).resize((size, size), Image.Resampling.BILINEAR)
+
+
+def feature_delta_heatmaps(
+    target_features: torch.Tensor,
+    pred_features: torch.Tensor,
+    frame_ids: list[int],
+    *,
+    reference_frame: int,
+    size: int,
+) -> tuple[list[Image.Image], list[Image.Image], list[Image.Image]]:
+    reference_frame = min(max(reference_frame, 0), target_features.shape[0] - 1)
+    target_ref = target_features[reference_frame]
+    pred_ref = pred_features[reference_frame]
+    target_delta = (target_features[frame_ids] - target_ref).float().norm(dim=-1)
+    pred_delta = (pred_features[frame_ids] - pred_ref).float().norm(dim=-1)
+    error = (pred_features[frame_ids] - target_features[frame_ids]).float().norm(dim=-1)
+    shared_delta_max = float(torch.cat([target_delta.flatten(), pred_delta.flatten()]).max().clamp_min(1e-6))
+    error_max = float(error.max().clamp_min(1e-6))
+    gt_delta = [scalar_grid_to_heatmap(frame, size=size, max_value=shared_delta_max) for frame in target_delta]
+    pred_delta_images = [scalar_grid_to_heatmap(frame, size=size, max_value=shared_delta_max) for frame in pred_delta]
+    error_images = [scalar_grid_to_heatmap(frame, size=size, max_value=error_max) for frame in error]
+    return gt_delta, pred_delta_images, error_images
+
+
 @torch.no_grad()
 def save_visualization(
     path: Path,
@@ -272,6 +309,15 @@ def save_visualization(
     if svg_model is not None:
         rows.append(
             (
+                "gt_feat_svg_rgb",
+                [
+                    lam_utils.decode_svg_feature_image(svg_model, target_features[idx], grid_size=grid_size)
+                    for idx in frame_ids
+                ],
+            )
+        )
+        rows.append(
+            (
                 "pred_feat_svg_rgb",
                 [
                     lam_utils.decode_svg_feature_image(svg_model, pred_features[idx], grid_size=grid_size)
@@ -283,15 +329,37 @@ def save_visualization(
     gt_pca, pred_pca = pca_feature_clip_images(target_features, pred_features, frame_ids)
     rows.append(("gt_feat", gt_pca))
     rows.append(("pred_feat", pred_pca))
+    gt_delta, pred_delta, error = feature_delta_heatmaps(
+        target_features,
+        pred_features,
+        frame_ids,
+        reference_frame=observed_frames - 1,
+        size=224,
+    )
+    rows.append(("gt_delta_ref", gt_delta))
+    rows.append(("pred_delta_ref", pred_delta))
+    rows.append(("abs_error", error))
+
+    pred_adjacent = (pred_features[1:] - pred_features[:-1]).float().norm(dim=-1).mean()
+    target_adjacent = (target_features[1:] - target_features[:-1]).float().norm(dim=-1).mean()
+    delta_ratio = pred_adjacent / target_adjacent.clamp_min(1e-6)
+    feature_mse = (pred_features.float() - target_features.float()).pow(2).mean()
+    title = (
+        f"feature_mse={float(feature_mse):.5f} "
+        f"pred_d={float(pred_adjacent):.3f} gt_d={float(target_adjacent):.3f} "
+        f"ratio={float(delta_ratio):.3f} observed_frames={observed_frames}"
+    )
 
     cell = 224
     label_h = 28
+    title_h = 32
     width = cell * len(frame_ids)
-    height = (cell + label_h) * len(rows)
+    height = title_h + (cell + label_h) * len(rows)
     canvas = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(canvas)
+    draw.text((8, 8), title, fill=(0, 0, 0))
     for row_idx, (row_name, panels) in enumerate(rows):
-        y = row_idx * (cell + label_h)
+        y = title_h + row_idx * (cell + label_h)
         for col_idx, panel in enumerate(panels):
             x = col_idx * cell
             canvas.paste(panel, (x, y))
