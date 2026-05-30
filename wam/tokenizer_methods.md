@@ -126,11 +126,31 @@ L = weighted_feature_mse
 - `external/openpi/scripts/pvvae_libero_svgp_4gpu_zzhong778.sbatch`
   - HPC 4-GPU launch script
 
-**当前实验经验：**
+**当前实验经验与路线更新：**
 
 - `stride=1` 对应 LIBERO 20Hz 下 `0.05s` frame interval，17 帧覆盖 `0.8s`。
 - `stride=2` 对应 `0.1s` interval，17 帧覆盖 `1.6s`，目前作为更合理的 diagnostic setting。
 - 观察到 `static_future_mse` 很低，说明静态 shortcut 很强；这不是代码崩，而是数据运动信号和 predictive objective 的组合问题。
+- 根据师兄最新建议，PV-VAE 下一步主线转到 OXE / Bridge v2。LIBERO 只作为历史 smoke/debug，不作为主要结论数据。
+- OXE 路径已知：`/data/user/jhe724/workspace/data/OXE`，优先尝试 Bridge v2 子集。
+- 当前最先要做的不是改 PV-VAE 模型，而是把 Bridge v2/OXE episode 转成统一 clip dataloader contract：
+
+```python
+{
+    "images": "[B,V,T,C,H,W]",
+    "actions": "[B,T-1,A] or None",
+    "instruction": "list[str] or None",
+    "dataset_name": "list[str]",
+    "episode_id": "list[str]",
+}
+```
+
+- 参考 `Reconstruction or Semantics?` 的思路，PV-VAE 的评价不能只看 reconstruction，还要看 latent 是否保留 action-relevant / task-relevant 信息。第一阶段先看 `future_mse < static_future_mse`、`delta_ratio` 不塌缩和 SVG/PCA 可视化；后续再加 inverse-dynamics / action probe。
+
+**当前执行入口：**
+
+- `wam/pvvae_oxe_execution_plan.md`: Bridge v2/OXE 执行计划。
+- `external/openpi/scripts/inspect_oxe_dataset.py`: OXE/Bridge v2 数据格式体检脚本，先用它确认 image/action/language 字段，再写正式 dataloader。
 
 ## 3. Delta Transition Tokenizer / DeltaTok-Style
 

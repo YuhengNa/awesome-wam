@@ -24,8 +24,10 @@ external/openpi/*
 !external/openpi/scripts/
 external/openpi/scripts/*
 !external/openpi/scripts/train_deltatok_libero.py
+!external/openpi/scripts/inspect_oxe_dataset.py
 !external/openpi/scripts/train_lam_libero.py
 !external/openpi/scripts/train_predictive_feature_vae_libero.py
+!external/openpi/scripts/train_predictive_feature_vae_lerobot.py
 !external/openpi/scripts/train_svae_libero.py
 !external/openpi/src/
 external/openpi/src/*
