@@ -54,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=512)
     parser.add_argument("--samples-per-episode", type=int, default=64)
     parser.add_argument("--dry-run-loader", action="store_true", help="Build dataset and print one batch without loading teachers.")
+    parser.add_argument("--min-rgb-delta", type=float, default=0.0, help="Reject clips whose max mean RGB delta to frame 0 is below this.")
+    parser.add_argument("--max-resample-attempts", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -139,12 +141,16 @@ class LocalLeRobotClipDataset(Dataset):
         max_episodes: int,
         samples_per_episode: int,
         seed: int,
+        min_rgb_delta: float,
+        max_resample_attempts: int,
     ):
         self.root = root
         self.video_keys = video_keys
         self.future_deltas = future_deltas
         self.frame_offsets = [0, *future_deltas]
         self.rng = random.Random(seed)
+        self.min_rgb_delta = min_rgb_delta
+        self.max_resample_attempts = max(max_resample_attempts, 1)
         self.info = self._load_info()
         self.video_paths = self._index_video_paths(video_keys)
         self.episodes = self._index_episodes(max_episodes)
@@ -200,7 +206,13 @@ class LocalLeRobotClipDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    @staticmethod
+    def clip_rgb_delta(images: torch.Tensor) -> float:
+        # images: [V,T,C,H,W]
+        delta = (images[:, 1:] - images[:, :1]).abs().mean(dim=(2, 3, 4))
+        return float(delta.max())
+
+    def _get_sample(self, index: int) -> dict[str, Any]:
         episode_list_index, start = self.samples[index]
         episode = self.episodes[episode_list_index]
         frame_indices = [start + offset for offset in self.frame_offsets]
@@ -209,17 +221,31 @@ class LocalLeRobotClipDataset(Dataset):
             frames = read_video_frames(self.video_paths[key][episode["episode_index"]], frame_indices)
             per_view.append(frames)
         images = torch.stack(per_view, dim=0)
+        rgb_delta = self.clip_rgb_delta(images)
         return {
             "images": images,
+            "rgb_delta": rgb_delta,
             "dataset_name": self.root.name,
             "episode_id": str(episode["episode_index"]),
             "start_index": start,
         }
 
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        sample = self._get_sample(index)
+        if self.min_rgb_delta <= 0 or sample["rgb_delta"] >= self.min_rgb_delta:
+            return sample
+        for _ in range(self.max_resample_attempts - 1):
+            new_index = random.randrange(len(self.samples))
+            sample = self._get_sample(new_index)
+            if sample["rgb_delta"] >= self.min_rgb_delta:
+                break
+        return sample
+
 
 def collate_clip_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "images": torch.stack([item["images"] for item in batch], dim=0),
+        "rgb_delta": torch.as_tensor([item["rgb_delta"] for item in batch], dtype=torch.float32),
         "dataset_name": [item["dataset_name"] for item in batch],
         "episode_id": [item["episode_id"] for item in batch],
         "start_index": torch.as_tensor([item["start_index"] for item in batch], dtype=torch.long),
@@ -280,6 +306,8 @@ def main() -> None:
         max_episodes=args.max_episodes,
         samples_per_episode=args.samples_per_episode,
         seed=args.seed,
+        min_rgb_delta=args.min_rgb_delta,
+        max_resample_attempts=args.max_resample_attempts,
     )
     loader = DataLoader(
         dataset,
@@ -303,17 +331,25 @@ def main() -> None:
             dataset.info.get("fps"),
             video_keys,
         )
+        logging.info("motion filter min_rgb_delta=%.6f max_resample_attempts=%d", args.min_rgb_delta, args.max_resample_attempts)
 
     if args.dry_run_loader:
         batch = next(iter(loader))
         images = batch["images"]
         if lam_utils.is_rank0():
             logging.info(
-                "dry_run batch images shape=%s dtype=%s min=%.4f max=%.4f dataset=%s episode=%s start=%s",
+                (
+                    "dry_run batch images shape=%s dtype=%s min=%.4f max=%.4f "
+                    "rgb_delta_shape=%s rgb_delta_mean=%.6f rgb_delta_max=%.6f "
+                    "dataset=%s episode=%s start=%s"
+                ),
                 tuple(images.shape),
                 images.dtype,
                 float(images.min()),
                 float(images.max()),
+                tuple(batch["rgb_delta"].shape),
+                float(batch["rgb_delta"].mean()),
+                float(batch["rgb_delta"].max()),
                 batch["dataset_name"][:4],
                 batch["episode_id"][:4],
                 batch["start_index"][:4].tolist(),
@@ -418,7 +454,7 @@ def main() -> None:
                     "step=%d loss=%.6f recon=%.6f cos=%.6f delta=%.6f kl=%.6f "
                     "obs_mse=%.6f future_mse=%.6f static_future_mse=%.6f "
                     "future_copy_ratio=%.3f pred_d=%.6f gt_d=%.6f d_ratio=%.3f "
-                    "obs_groups=%d grad=%.3f steps/s=%.3f"
+                    "rgb_delta_mean=%.6f rgb_delta_max=%.6f obs_groups=%d grad=%.3f steps/s=%.3f"
                 ),
                 step,
                 float(loss_dict["loss"].detach().cpu()),
@@ -433,6 +469,8 @@ def main() -> None:
                 float(loss_dict["pred_delta_norm"].detach().cpu()),
                 float(loss_dict["target_delta_norm"].detach().cpu()),
                 float(loss_dict["delta_ratio"].detach().cpu()),
+                float(batch["rgb_delta"].mean().cpu()),
+                float(batch["rgb_delta"].max().cpu()),
                 observed_groups,
                 float(grad_norm.detach().cpu()),
                 steps_per_sec,
