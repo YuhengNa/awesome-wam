@@ -271,14 +271,17 @@ def main() -> None:
                 copy_mse = F.mse_loss(current_features.float(), future_features.float())
                 raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
                 zero_z = torch.zeros_like(outputs["z_delta"])
-                zero_pred = raw_model.decode(current_features, zero_z)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    zero_pred = raw_model.decode(current_features, zero_z)
+                    if outputs["z_delta"].shape[0] > 1:
+                        shuffled_z = outputs["z_delta"][
+                            torch.randperm(outputs["z_delta"].shape[0], device=outputs["z_delta"].device)
+                        ]
+                        shuffled_pred = raw_model.decode(current_features, shuffled_z)
+                    else:
+                        shuffled_pred = zero_pred
                 zero_z_mse = F.mse_loss(zero_pred.float(), future_features.float())
-                if outputs["z_delta"].shape[0] > 1:
-                    shuffled_z = outputs["z_delta"][torch.randperm(outputs["z_delta"].shape[0], device=outputs["z_delta"].device)]
-                    shuffled_pred = raw_model.decode(current_features, shuffled_z)
-                    shuffle_z_mse = F.mse_loss(shuffled_pred.float(), future_features.float())
-                else:
-                    shuffle_z_mse = zero_z_mse
+                shuffle_z_mse = F.mse_loss(shuffled_pred.float(), future_features.float())
                 target_delta = future_features.float() - current_features.float()
                 pred_delta = pred.float() - current_features.float()
                 delta_ratio = pred_delta.norm() / target_delta.norm().clamp_min(1e-6)
