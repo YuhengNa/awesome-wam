@@ -49,7 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-rgb-mean", type=float, default=None)
     parser.add_argument("--min-rgb-std", type=float, default=None)
     parser.add_argument("--max-resample-attempts", type=int, default=200)
-    parser.add_argument("--feature-normalization", choices=("none", "l2", "token_layer_norm"), default=None)
+    parser.add_argument("--feature-normalization", choices=("none", "l2", "token_layer_norm", "channel_standard"), default=None)
+    parser.add_argument("--feature-stats", default=None)
     parser.add_argument("--encoder-microbatch", type=int, default=None)
     parser.add_argument("--precision", choices=("bfloat16", "float32"), default=None)
     parser.add_argument("--decode-svg-rgb", action=argparse.BooleanOptionalAction, default=True)
@@ -92,6 +93,7 @@ def prepare_model_args(args: argparse.Namespace, checkpoint_args: dict[str, Any]
         ("min_rgb_mean", 0.0),
         ("min_rgb_std", 0.0),
         ("feature_normalization", "none"),
+        ("feature_stats", None),
         ("encoder_microbatch", 16),
         ("precision", "bfloat16"),
         ("svg_autoencoder_root", None),
@@ -193,9 +195,9 @@ def main() -> None:
     )
 
     if args.teacher == "svg_p":
-        if args.feature_normalization != "none":
-            raise ValueError("SVG-P visualization requires --feature-normalization none for matched decode.")
-        encoder = lam_utils.load_svg_decoder(args, device)
+        svg_args = argparse.Namespace(**vars(args))
+        svg_args.feature_normalization = "none"
+        encoder = lam_utils.load_svg_decoder(svg_args, device)
         svg_model = encoder if args.decode_svg_rgb else None
     else:
         from openpi.models_pytorch.dinov3_vit import load_dinov3_patch_encoder
@@ -206,6 +208,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True))
+    feature_stats = lerobot_train.load_feature_stats(args.feature_stats, device)
     logging.info(
         "checkpoint=%s step=%s clips=%d teacher=%s observed_groups=%d observed_frames=%d",
         args.checkpoint,
@@ -221,9 +224,11 @@ def main() -> None:
     for batch in loader:
         images = batch["images"].to(device, non_blocking=True)
         features = encode_clip(teacher=args.teacher, encoder=encoder, images=images, args=args)
-        features = lam_utils.normalize_features(features, args.feature_normalization)
+        features = lerobot_train.normalize_feature_clip(features, args.feature_normalization, feature_stats)
         with torch.no_grad():
             pred = model(features, observed_groups)["pred"].detach()
+        vis_features = lerobot_train.denormalize_feature_clip(features, args.feature_normalization, feature_stats)
+        vis_pred = lerobot_train.denormalize_feature_clip(pred, args.feature_normalization, feature_stats)
 
         batch_size = images.shape[0]
         for item_idx in range(batch_size):
@@ -232,8 +237,8 @@ def main() -> None:
             pv_utils.save_visualization(
                 output_dir / filename,
                 images[item_idx, 0],
-                features[item_idx, 0],
-                pred[item_idx, 0],
+                vis_features[item_idx, 0],
+                vis_pred[item_idx, 0],
                 svg_model,
                 grid_size=args.svg_decode_grid,
                 observed_frames=observed_frames,

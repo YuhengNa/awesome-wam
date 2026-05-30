@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=512)
     parser.add_argument("--samples-per-episode", type=int, default=64)
     parser.add_argument("--dry-run-loader", action="store_true", help="Build dataset and print one batch without loading teachers.")
+    parser.add_argument("--overfit-first-batch", action="store_true", help="Reuse the first DataLoader batch for every step.")
     parser.add_argument("--min-rgb-delta", type=float, default=0.0, help="Reject clips whose max mean RGB delta to frame 0 is below this.")
     parser.add_argument("--min-rgb-mean", type=float, default=0.0, help="Reject near-black clips whose mean RGB is below this.")
     parser.add_argument("--min-rgb-std", type=float, default=0.0, help="Reject flat clips whose RGB std is below this.")
@@ -74,7 +75,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--future-loss-weight", type=float, default=1.0)
     parser.add_argument("--observed-groups", type=int, default=0)
     parser.add_argument("--min-observed-groups", type=int, default=1)
-    parser.add_argument("--feature-normalization", choices=("none", "l2", "token_layer_norm"), default="none")
+    parser.add_argument("--feature-normalization", choices=("none", "l2", "token_layer_norm", "channel_standard"), default="none")
+    parser.add_argument("--feature-stats", default=None, help="Path to stats .pt produced by compute_lerobot_feature_stats.py.")
     parser.add_argument("--encoder-microbatch", type=int, default=16)
     parser.add_argument("--precision", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--log-interval", type=int, default=20)
@@ -291,6 +293,34 @@ def choose_observed_groups(args: argparse.Namespace, total_groups: int) -> int:
     return random.randint(min_groups, total_groups)
 
 
+def load_feature_stats(path: str | None, device: torch.device) -> dict[str, torch.Tensor] | None:
+    if path is None:
+        return None
+    stats = torch.load(path, map_location="cpu", weights_only=False)
+    return {
+        "mean": stats["mean"].to(device=device, dtype=torch.float32).view(1, 1, 1, 1, -1),
+        "std": stats["std"].to(device=device, dtype=torch.float32).clamp_min(1e-6).view(1, 1, 1, 1, -1),
+    }
+
+
+def normalize_feature_clip(features: torch.Tensor, mode: str, stats: dict[str, torch.Tensor] | None) -> torch.Tensor:
+    import train_lam_libero as lam_utils
+
+    if mode == "channel_standard":
+        if stats is None:
+            raise ValueError("--feature-normalization channel_standard requires --feature-stats.")
+        return (features - stats["mean"]) / stats["std"]
+    return lam_utils.normalize_features(features, mode)
+
+
+def denormalize_feature_clip(features: torch.Tensor, mode: str, stats: dict[str, torch.Tensor] | None) -> torch.Tensor:
+    if mode == "channel_standard":
+        if stats is None:
+            raise ValueError("--feature-normalization channel_standard requires --feature-stats.")
+        return features * stats["std"] + stats["mean"]
+    return features
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -403,9 +433,9 @@ def main() -> None:
     encoder = None
     svg_model = None
     if args.teacher == "svg_p":
-        if args.feature_normalization != "none":
-            raise ValueError("SVG-P teacher requires --feature-normalization none for matched decode.")
-        svg_model = lam_utils.load_svg_decoder(args, device)
+        svg_args = argparse.Namespace(**vars(args))
+        svg_args.feature_normalization = "none"
+        svg_model = lam_utils.load_svg_decoder(svg_args, device)
         feature_dim = args.svg_feature_dim
     else:
         from openpi.models_pytorch.dinov3_vit import load_dinov3_patch_encoder
@@ -434,6 +464,9 @@ def main() -> None:
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    feature_stats = load_feature_stats(args.feature_stats, device)
+    if args.feature_normalization == "channel_standard" and lam_utils.is_rank0():
+        logging.info("Using channel_standard feature stats from %s", args.feature_stats)
 
     if lam_utils.is_rank0():
         param_count = sum(p.numel() for p in (model.module if use_ddp else model).parameters())
@@ -449,14 +482,26 @@ def main() -> None:
         )
 
     iterator = iter(loader)
+    fixed_batch = None
+    if args.overfit_first_batch:
+        fixed_batch = next(iterator)
+        if lam_utils.is_rank0():
+            logging.info(
+                "overfit_first_batch enabled: reusing episode=%s start=%s",
+                fixed_batch["episode_id"],
+                fixed_batch["start_index"].tolist(),
+            )
     start_time = time.time()
     last_log_time = start_time
     for step in range(1, args.max_steps + 1):
-        try:
-            batch = next(iterator)
-        except StopIteration:
-            iterator = iter(loader)
-            batch = next(iterator)
+        if fixed_batch is not None:
+            batch = fixed_batch
+        else:
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                iterator = iter(loader)
+                batch = next(iterator)
 
         image_clip = batch["images"].to(device, non_blocking=True)
         if args.teacher == "svg_p":
@@ -474,7 +519,7 @@ def main() -> None:
                 microbatch=args.encoder_microbatch,
                 precision=args.precision,
             )
-        features = lam_utils.normalize_features(features, args.feature_normalization)
+        features = normalize_feature_clip(features, args.feature_normalization, feature_stats)
 
         observed_groups = choose_observed_groups(args, total_groups)
         optimizer.zero_grad(set_to_none=True)
@@ -524,11 +569,13 @@ def main() -> None:
 
         if args.vis_interval > 0 and step % args.vis_interval == 0 and lam_utils.is_rank0():
             pred = loss_dict["pred"].detach()
+            vis_features = denormalize_feature_clip(features, args.feature_normalization, feature_stats)
+            vis_pred = denormalize_feature_clip(pred, args.feature_normalization, feature_stats)
             pv_utils.save_visualization(
                 output_dir / "vis" / f"step_{step:06d}.png",
                 image_clip[0, 0],
-                features[0, 0],
-                pred[0, 0],
+                vis_features[0, 0],
+                vis_pred[0, 0],
                 svg_model if args.decode_svg_rgb else None,
                 grid_size=args.svg_decode_grid,
                 observed_frames=1 + (observed_groups - 1) * args.temporal_compression,
