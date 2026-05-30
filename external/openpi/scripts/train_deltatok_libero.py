@@ -251,14 +251,26 @@ def main() -> None:
             with torch.no_grad():
                 mse = F.mse_loss(pred.float(), future_features.float())
                 copy_mse = F.mse_loss(current_features.float(), future_features.float())
+                raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+                zero_z = torch.zeros_like(outputs["z_delta"])
+                zero_pred = raw_model.decode(current_features, zero_z)
+                zero_z_mse = F.mse_loss(zero_pred.float(), future_features.float())
+                if outputs["z_delta"].shape[0] > 1:
+                    shuffled_z = outputs["z_delta"][torch.randperm(outputs["z_delta"].shape[0], device=outputs["z_delta"].device)]
+                    shuffled_pred = raw_model.decode(current_features, shuffled_z)
+                    shuffle_z_mse = F.mse_loss(shuffled_pred.float(), future_features.float())
+                else:
+                    shuffle_z_mse = zero_z_mse
                 target_delta = future_features.float() - current_features.float()
                 pred_delta = pred.float() - current_features.float()
                 delta_ratio = pred_delta.norm() / target_delta.norm().clamp_min(1e-6)
+                copy_ratio = mse / copy_mse.clamp_min(1e-6)
                 token_norm = outputs["z_delta"].float().norm(dim=-1).mean()
                 target_delta_norm = target_delta.norm(dim=-1).mean()
             logging.info(
                 (
                     "step=%d loss=%.6f mse=%.6f cos=%.6f copy_mse=%.6f "
+                    "copy_ratio=%.3f zero_z_mse=%.6f shuffle_z_mse=%.6f "
                     "delta_ratio=%.3f z_norm=%.4f target_delta_norm=%.4f grad=%.3f steps/s=%.3f"
                 ),
                 step,
@@ -266,6 +278,9 @@ def main() -> None:
                 float(mse.detach().cpu()),
                 float(cosine_loss.detach().cpu()),
                 float(copy_mse.detach().cpu()),
+                float(copy_ratio.detach().cpu()),
+                float(zero_z_mse.detach().cpu()),
+                float(shuffle_z_mse.detach().cpu()),
                 float(delta_ratio.detach().cpu()),
                 float(token_norm.detach().cpu()),
                 float(target_delta_norm.detach().cpu()),
