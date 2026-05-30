@@ -192,7 +192,7 @@ x_t + z_delta -> x_hat_{t+k}
 - `external/openpi/scripts/train_deltatok_libero.py`
   - 已切换到正式 `FeatureDeltaTokenizer`
   - 支持 `--num-delta-tokens`
-  - 记录 `copy_mse`, `delta_ratio`, `z_norm`, `target_delta_norm`
+  - 记录 `copy_mse`, `copy_ratio`, `zero_z_mse`, `shuffle_z_mse`, `delta_ratio`, `z_norm`, `z_raw_norm`, `target_delta_norm`, `z_delta_corr`
 
 当前实现 contract：
 
@@ -202,6 +202,19 @@ decode(x_t, z_delta) -> x_hat_{t+k}
 ```
 
 其中 `M` 可以先从 1 开始，再扩展到 4/8 个 delta tokens。
+
+**当前 Delta smoke 观察：**
+
+- `M=1,d=96,stride=4`、`M=4,d=96,stride=4`、`M=1,d=96,stride=8` 均能正常训练，说明 dataloader、SVG-P teacher、Delta tokenizer、反向传播和 checkpoint 链路已经跑通。
+- 但 100-step 结果里 `mse` 仍高于 `copy_mse`，也就是尚未超过直接复制当前 feature 的 static-copy baseline。
+- 新增诊断发现 `normal z`、`zero z`、`shuffle z` 的 future feature MSE 非常接近，说明当前 decoder 很可能还没有真正利用 `z_delta` 表达变化。
+- 之前的 `z_norm` 来自 LayerNorm 后的 token，数值会天然接近 `sqrt(d)`，不能直接用来判断变化幅度。现在额外记录 `z_raw_norm` 和 `z_delta_corr`，用于检查 raw delta token magnitude 是否和 `||x_{t+k}-x_t||` 相关。
+
+**下一步 Delta 诊断优先级：**
+
+1. 先跑 paper-faithful / low-bottleneck 对照：`M=1,d=384` 与 `M=1,d=96`，并加 `--no-normalize-delta-tokens`，观察 `copy_ratio`、`zero_z_mse`、`shuffle_z_mse`、`z_delta_corr`。
+2. 同 teacher、同 stride 下跑 DreamDojo-style LAM baseline，确认现有 `FeatureLatentActionModel` 是否比 Delta prototype 更会利用 bottleneck。
+3. 如果仍然被 static-copy baseline 压制，再引入 high-motion / action-salient sampling 或 motion-weighted feature loss，而不是盲目增加 `M` 或训练步数。
 
 尚未完成：
 
@@ -213,9 +226,9 @@ decode(x_t, z_delta) -> x_hat_{t+k}
 
 | 方法 | 表示什么 | 时序压缩 | 当前状态 | 主要风险 |
 |---|---|---:|---|---|
-| Per-frame S-VAE | 单帧 semantic state | 否 | 未实现；pi0.5 gen target 有相关基础设施 | 创新性弱，仍预测整帧 |
+| Per-frame S-VAE | 单帧 semantic state | 否 | 已实现 standalone adapter，并完成 SVG-P smoke | 创新性弱，仍预测整帧 |
 | PV-VAE-style | 一段 clip 的 compressed latent groups | 是，4x | 已实现并在跑 LIBERO/SVG-P | 静态复制 shortcut |
-| Delta tokenizer | `x_t -> x_{t+k}` 的变化 | transition-level | 有 LAM 原型，未实现正式 DeltaTok | 依赖上一帧，多步误差 |
+| Delta tokenizer | `x_t -> x_{t+k}` 的变化 | transition-level | 已有正式 Delta tokenizer 原型，正在做 copy/zero/shuffle 诊断 | 依赖上一帧，多步误差；目前尚未超过 static-copy baseline |
 
 当前判断：
 

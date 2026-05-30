@@ -33,6 +33,7 @@ class FeatureDeltaTokenizerConfig:
     max_views: int = 4
     max_tokens_per_view: int = 1024
     decode_residual: bool = True
+    normalize_tokens: bool = True
     cosine_weight: float = 0.0
 
 
@@ -113,14 +114,19 @@ class FeatureDeltaTokenizer(nn.Module):
         hidden = hidden + self.pos_embed[:tokens].view(1, 1, tokens, -1)
         return hidden.reshape(batch, views * tokens, self.config.model_dim)
 
-    def encode(self, current_features: torch.Tensor, future_features: torch.Tensor) -> torch.Tensor:
+    def encode_raw(self, current_features: torch.Tensor, future_features: torch.Tensor) -> torch.Tensor:
         current = self._project_features(current_features, time_index=0)
         future = self._project_features(future_features, time_index=1)
         query = self.delta_query.unsqueeze(0).expand(current.shape[0], -1, -1)
         hidden = torch.cat([query, current, future], dim=1)
         hidden = self.encoder(hidden)
-        delta_tokens = self.to_token(hidden[:, : self.config.num_delta_tokens])
-        return self.token_norm(delta_tokens)
+        return self.to_token(hidden[:, : self.config.num_delta_tokens])
+
+    def encode(self, current_features: torch.Tensor, future_features: torch.Tensor) -> torch.Tensor:
+        delta_tokens = self.encode_raw(current_features, future_features)
+        if self.config.normalize_tokens:
+            return self.token_norm(delta_tokens)
+        return delta_tokens
 
     def decode(self, current_features: torch.Tensor, delta_tokens: torch.Tensor) -> torch.Tensor:
         if delta_tokens.ndim != 3:
@@ -144,9 +150,10 @@ class FeatureDeltaTokenizer(nn.Module):
         return decoded
 
     def forward(self, current_features: torch.Tensor, future_features: torch.Tensor) -> dict[str, torch.Tensor]:
-        z_delta = self.encode(current_features, future_features)
+        z_delta_raw = self.encode_raw(current_features, future_features)
+        z_delta = self.token_norm(z_delta_raw) if self.config.normalize_tokens else z_delta_raw
         pred = self.decode(current_features, z_delta)
-        return {"pred": pred, "z_delta": z_delta}
+        return {"pred": pred, "z_delta": z_delta, "z_delta_raw": z_delta_raw}
 
     def compute_loss(self, current_features: torch.Tensor, future_features: torch.Tensor) -> dict[str, torch.Tensor]:
         outputs = self(current_features, future_features)
@@ -160,6 +167,7 @@ class FeatureDeltaTokenizer(nn.Module):
             pred_delta = pred.float() - current_features.float()
             delta_ratio = pred_delta.norm() / target_delta.norm().clamp_min(1e-6)
             token_norm = outputs["z_delta"].float().norm(dim=-1).mean()
+            raw_token_norm = outputs["z_delta_raw"].float().norm(dim=-1).mean()
             delta_norm = target_delta.norm(dim=-1).mean()
         return {
             "loss": loss,
@@ -168,7 +176,9 @@ class FeatureDeltaTokenizer(nn.Module):
             "copy_mse": copy_mse.detach(),
             "delta_ratio": delta_ratio.detach(),
             "token_norm": token_norm.detach(),
+            "raw_token_norm": raw_token_norm.detach(),
             "target_delta_norm": delta_norm.detach(),
             "pred": pred.detach(),
             "z_delta": outputs["z_delta"].detach(),
+            "z_delta_raw": outputs["z_delta_raw"].detach(),
         }

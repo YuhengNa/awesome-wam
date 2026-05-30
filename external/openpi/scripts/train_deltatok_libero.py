@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smooth-l1-beta", type=float, default=0.1)
     parser.add_argument("--cosine-weight", type=float, default=0.0)
     parser.add_argument("--decode-residual", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--normalize-delta-tokens", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--feature-normalization", choices=("token_layer_norm", "l2", "none"), default="none")
     parser.add_argument("--encoder-microbatch", type=int, default=64)
     parser.add_argument("--precision", choices=("bfloat16", "float32"), default="bfloat16")
@@ -100,6 +101,17 @@ def feature_loss(pred: torch.Tensor, target: torch.Tensor, args: argparse.Namesp
         return F.smooth_l1_loss(pred.float(), target.detach().float(), beta=args.smooth_l1_beta)
     # Stable log(cosh(x)).
     return (diff + F.softplus(-2.0 * diff) - torch.log(torch.tensor(2.0, device=diff.device))).mean()
+
+
+def batch_pearson_corr(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    if left.numel() < 2:
+        return left.new_tensor(float("nan"))
+    left = left.float().flatten()
+    right = right.float().flatten()
+    left = left - left.mean()
+    right = right - right.mean()
+    denom = left.norm() * right.norm()
+    return (left * right).sum() / denom.clamp_min(1e-6)
 
 
 def save_checkpoint(
@@ -163,6 +175,7 @@ def main() -> None:
         num_heads=args.heads,
         max_views=max(4, len(views)),
         decode_residual=args.decode_residual,
+        normalize_tokens=args.normalize_delta_tokens,
         cosine_weight=args.cosine_weight,
     )
     model = FeatureDeltaTokenizer(model_config).to(device)
@@ -173,7 +186,10 @@ def main() -> None:
     if lam_utils.is_rank0():
         logging.info("DeltaTok config: %s", model_config)
         logging.info(
-            "teacher=%s views=%s stride=%d feature_dim=%d model_dim=%d M=%d token_dim=%d residual=%s output_dir=%s",
+            (
+                "teacher=%s views=%s stride=%d feature_dim=%d model_dim=%d M=%d token_dim=%d "
+                "residual=%s normalize_delta_tokens=%s output_dir=%s"
+            ),
             args.teacher,
             views,
             args.delta_stride,
@@ -182,6 +198,7 @@ def main() -> None:
             args.num_delta_tokens,
             model.module.token_dim if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model.token_dim,
             args.decode_residual,
+            args.normalize_delta_tokens,
             output_dir,
         )
 
@@ -250,6 +267,7 @@ def main() -> None:
             last_log_time = now
             with torch.no_grad():
                 mse = F.mse_loss(pred.float(), future_features.float())
+                cosine_metric = 1.0 - F.cosine_similarity(pred.float(), future_features.float(), dim=-1).mean()
                 copy_mse = F.mse_loss(current_features.float(), future_features.float())
                 raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
                 zero_z = torch.zeros_like(outputs["z_delta"])
@@ -266,24 +284,31 @@ def main() -> None:
                 delta_ratio = pred_delta.norm() / target_delta.norm().clamp_min(1e-6)
                 copy_ratio = mse / copy_mse.clamp_min(1e-6)
                 token_norm = outputs["z_delta"].float().norm(dim=-1).mean()
+                raw_token_norm = outputs["z_delta_raw"].float().norm(dim=-1).mean()
                 target_delta_norm = target_delta.norm(dim=-1).mean()
+                raw_token_norm_per_sample = outputs["z_delta_raw"].float().norm(dim=-1).mean(dim=-1)
+                target_delta_norm_per_sample = target_delta.norm(dim=-1).mean(dim=(1, 2))
+                z_delta_corr = batch_pearson_corr(raw_token_norm_per_sample, target_delta_norm_per_sample)
             logging.info(
                 (
                     "step=%d loss=%.6f mse=%.6f cos=%.6f copy_mse=%.6f "
                     "copy_ratio=%.3f zero_z_mse=%.6f shuffle_z_mse=%.6f "
-                    "delta_ratio=%.3f z_norm=%.4f target_delta_norm=%.4f grad=%.3f steps/s=%.3f"
+                    "delta_ratio=%.3f z_norm=%.4f z_raw_norm=%.4f "
+                    "target_delta_norm=%.4f z_delta_corr=%.3f grad=%.3f steps/s=%.3f"
                 ),
                 step,
                 float(loss.detach().cpu()),
                 float(mse.detach().cpu()),
-                float(cosine_loss.detach().cpu()),
+                float(cosine_metric.detach().cpu()),
                 float(copy_mse.detach().cpu()),
                 float(copy_ratio.detach().cpu()),
                 float(zero_z_mse.detach().cpu()),
                 float(shuffle_z_mse.detach().cpu()),
                 float(delta_ratio.detach().cpu()),
                 float(token_norm.detach().cpu()),
+                float(raw_token_norm.detach().cpu()),
                 float(target_delta_norm.detach().cpu()),
+                float(z_delta_corr.detach().cpu()),
                 float(grad_norm.detach().cpu()),
                 steps_per_sec,
             )
