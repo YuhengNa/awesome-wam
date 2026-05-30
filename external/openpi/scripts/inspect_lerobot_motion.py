@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-episode", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rgb-static-threshold", type=float, default=0.005)
+    parser.add_argument("--rgb-black-mean-threshold", type=float, default=0.01)
+    parser.add_argument("--rgb-flat-std-threshold", type=float, default=0.01)
     parser.add_argument("--action-static-threshold", type=float, default=1e-4)
     return parser.parse_args()
 
@@ -53,6 +55,14 @@ def episode_index_from_path(path: Path) -> int:
     if match is None:
         raise ValueError(f"Cannot parse episode index from {path}")
     return int(match.group(1))
+
+
+def episode_key_from_data_path(path: Path) -> tuple[str, int]:
+    return path.parent.name, episode_index_from_path(path)
+
+
+def episode_key_from_video_path(path: Path) -> tuple[str, int]:
+    return path.parent.parent.name, episode_index_from_path(path)
 
 
 def parquet_table(path: Path):
@@ -139,14 +149,16 @@ def main() -> None:
     video_paths = sorted((root / "videos").glob(f"chunk-*/{args.video_key}/episode_*.mp4"))
     if not video_paths:
         video_paths = sorted((root / "videos").glob(f"chunk-*/*{args.video_key}*/episode_*.mp4"))
-    video_by_episode = {episode_index_from_path(path): path for path in video_paths}
+    video_by_episode = {episode_key_from_video_path(path): path for path in video_paths}
+    video_index_only = Counter(episode_index_from_path(path) for path in video_paths)
 
     parquet_paths = sorted((root / "data").glob("chunk-*/episode_*.parquet"))
-    episodes: list[tuple[int, Path, Any]] = []
+    episodes: list[tuple[int, tuple[str, int], Path, Any]] = []
     action_columns: Counter[str] = Counter()
     for parquet_path in parquet_paths:
         episode_idx = episode_index_from_path(parquet_path)
-        if episode_idx not in video_by_episode:
+        episode_key = episode_key_from_data_path(parquet_path)
+        if episode_key not in video_by_episode:
             continue
         table = parquet_table(parquet_path)
         for name in table_column_names(table):
@@ -154,11 +166,12 @@ def main() -> None:
                 action_columns[name] += 1
         if table_num_rows(table) <= max(future_deltas):
             continue
-        episodes.append((episode_idx, parquet_path, table))
+        episodes.append((episode_idx, episode_key, parquet_path, table))
         if args.max_episodes > 0 and len(episodes) >= args.max_episodes:
             break
 
     print(f"episodes={len(episodes)} videos={len(video_by_episode)} parquet_files={len(parquet_paths)}")
+    print(f"duplicate_episode_ids_across_video_chunks={sum(count > 1 for count in video_index_only.values())}")
     print(f"action_columns={dict(action_columns)}")
     if not episodes:
         raise ValueError("No usable episodes found.")
@@ -166,6 +179,8 @@ def main() -> None:
     rgb_first_last: list[float] = []
     rgb_adjacent: list[float] = []
     rgb_max_frame_delta: list[float] = []
+    rgb_mean_values: list[float] = []
+    rgb_std_values: list[float] = []
     action_first_last: list[float] = []
     action_adjacent: list[float] = []
     action_norm: list[float] = []
@@ -173,7 +188,7 @@ def main() -> None:
     failed_videos = 0
     max_delta = max(future_deltas)
 
-    for episode_idx, _, table in episodes:
+    for episode_idx, episode_key, _, table in episodes:
         num_rows = table_num_rows(table)
         max_start = num_rows - 1 - max_delta
         starts = list(range(max_start + 1))
@@ -184,7 +199,7 @@ def main() -> None:
         for start in starts:
             frame_indices = [start + offset for offset in frame_offsets]
             try:
-                frames = read_video_frames(video_by_episode[episode_idx], frame_indices)
+                frames = read_video_frames(video_by_episode[episode_key], frame_indices)
             except Exception:
                 failed_videos += 1
                 continue
@@ -193,6 +208,8 @@ def main() -> None:
             rgb_first_last.append(float(diff_to_first[-1]))
             rgb_adjacent.append(float(adjacent.mean()))
             rgb_max_frame_delta.append(float(diff_to_first.max()))
+            rgb_mean_values.append(float(frames.mean()))
+            rgb_std_values.append(float(frames.std()))
 
             if action is not None:
                 action_clip = np.asarray(action[frame_indices])
@@ -207,6 +224,8 @@ def main() -> None:
     print_summary("rgb_first_last_mean_abs", rgb_first_last)
     print_summary("rgb_adjacent_mean_abs", rgb_adjacent)
     print_summary("rgb_max_delta_to_first", rgb_max_frame_delta)
+    print_summary("rgb_mean", rgb_mean_values)
+    print_summary("rgb_std", rgb_std_values)
     print_summary("action_first_last_l2", action_first_last)
     print_summary("action_adjacent_l2", action_adjacent)
     print_summary("action_norm_l2", action_norm)
@@ -214,6 +233,10 @@ def main() -> None:
     if sampled > 0:
         rgb_static = sum(value < args.rgb_static_threshold for value in rgb_max_frame_delta) / sampled
         print(f"rgb_static_ratio@{args.rgb_static_threshold:.6f}={rgb_static:.6f}")
+        rgb_black = sum(value < args.rgb_black_mean_threshold for value in rgb_mean_values) / sampled
+        rgb_flat = sum(value < args.rgb_flat_std_threshold for value in rgb_std_values) / sampled
+        print(f"rgb_black_ratio@mean<{args.rgb_black_mean_threshold:.6f}={rgb_black:.6f}")
+        print(f"rgb_flat_ratio@std<{args.rgb_flat_std_threshold:.6f}={rgb_flat:.6f}")
     if action_norm:
         action_static = sum(value < args.action_static_threshold for value in action_norm) / len(action_norm)
         print(f"action_static_ratio@{args.action_static_threshold:.6f}={action_static:.6f}")

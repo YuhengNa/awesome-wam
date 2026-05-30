@@ -38,6 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=512)
     parser.add_argument("--samples-per-episode", type=int, default=8)
     parser.add_argument("--min-rgb-delta", type=float, default=0.0)
+    parser.add_argument("--min-rgb-mean", type=float, default=0.0)
+    parser.add_argument("--min-rgb-std", type=float, default=0.0)
     parser.add_argument("--max-resample-attempts", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cell-size", type=int, default=128)
@@ -50,6 +52,14 @@ def episode_index_from_path(path: Path) -> int:
     if match is None:
         raise ValueError(f"Cannot parse episode index from {path}")
     return int(match.group(1))
+
+
+def episode_key_from_data_path(path: Path) -> tuple[str, int]:
+    return path.parent.name, episode_index_from_path(path)
+
+
+def episode_key_from_video_path(path: Path) -> tuple[str, int]:
+    return path.parent.parent.name, episode_index_from_path(path)
 
 
 def parquet_table(path: Path):
@@ -109,6 +119,10 @@ def rgb_delta_metrics(frames: torch.Tensor) -> tuple[float, float, list[float]]:
     return float(deltas.max()), float(adjacent.mean()), [float(v) for v in deltas]
 
 
+def rgb_quality_metrics(frames: torch.Tensor) -> tuple[float, float]:
+    return float(frames.mean()), float(frames.std())
+
+
 def action_metrics(action: np.ndarray | None, frame_indices: list[int]) -> tuple[float | None, float | None]:
     if action is None:
         return None, None
@@ -123,7 +137,7 @@ def build_candidates(root: Path, video_key: str, future_deltas: tuple[int, ...],
     video_paths = sorted((root / "videos").glob(f"chunk-*/{video_key}/episode_*.mp4"))
     if not video_paths:
         video_paths = sorted((root / "videos").glob(f"chunk-*/*{video_key}*/episode_*.mp4"))
-    videos = {episode_index_from_path(path): path for path in video_paths}
+    videos = {episode_key_from_video_path(path): path for path in video_paths}
     parquet_paths = sorted((root / "data").glob("chunk-*/episode_*.parquet"))
     candidates = []
     max_delta = max(future_deltas)
@@ -131,7 +145,8 @@ def build_candidates(root: Path, video_key: str, future_deltas: tuple[int, ...],
     episodes_seen = 0
     for parquet_path in parquet_paths:
         episode_idx = episode_index_from_path(parquet_path)
-        if episode_idx not in videos:
+        episode_key = episode_key_from_data_path(parquet_path)
+        if episode_key not in videos:
             continue
         table = parquet_table(parquet_path)
         if table.num_rows <= max_delta:
@@ -145,7 +160,8 @@ def build_candidates(root: Path, video_key: str, future_deltas: tuple[int, ...],
             candidates.append(
                 {
                     "episode_idx": episode_idx,
-                    "video_path": videos[episode_idx],
+                    "episode_key": episode_key,
+                    "video_path": videos[episode_key],
                     "start": start,
                     "action": action,
                 }
@@ -222,13 +238,21 @@ def main() -> None:
         frame_indices = [candidate["start"] + offset for offset in frame_offsets]
         frames = read_video_frames(candidate["video_path"], frame_indices)
         rgb_max, rgb_adj, per_frame_delta = rgb_delta_metrics(frames)
-        if rgb_max < args.min_rgb_delta and attempts < args.max_resample_attempts:
+        rgb_mean, rgb_std = rgb_quality_metrics(frames)
+        if (
+            (
+                rgb_max < args.min_rgb_delta
+                or rgb_mean < args.min_rgb_mean
+                or rgb_std < args.min_rgb_std
+            )
+            and attempts < args.max_resample_attempts
+        ):
             continue
         action_fl, action_adj = action_metrics(candidate["action"], frame_indices)
 
         title = (
             f"{root.name} ep={candidate['episode_idx']} start={candidate['start']} fps={info.get('fps')} "
-            f"rgb_max={rgb_max:.4f} rgb_adj={rgb_adj:.4f} "
+            f"rgb_max={rgb_max:.4f} rgb_adj={rgb_adj:.4f} rgb_mean={rgb_mean:.4f} rgb_std={rgb_std:.4f} "
             f"action_fl={action_fl if action_fl is not None else 'NA'}"
         )
         labels = [f"t+{offset}" for offset in frame_offsets]
@@ -245,10 +269,13 @@ def main() -> None:
             {
                 "file": filename,
                 "episode_idx": candidate["episode_idx"],
+                "episode_key": list(candidate["episode_key"]),
                 "start": candidate["start"],
                 "frame_offsets": frame_offsets,
                 "rgb_max_delta_to_first": rgb_max,
                 "rgb_adjacent_delta": rgb_adj,
+                "rgb_mean": rgb_mean,
+                "rgb_std": rgb_std,
                 "per_frame_delta_to_first": per_frame_delta,
                 "action_first_last_l2": action_fl,
                 "action_adjacent_l2": action_adj,

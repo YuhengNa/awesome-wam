@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples-per-episode", type=int, default=64)
     parser.add_argument("--dry-run-loader", action="store_true", help="Build dataset and print one batch without loading teachers.")
     parser.add_argument("--min-rgb-delta", type=float, default=0.0, help="Reject clips whose max mean RGB delta to frame 0 is below this.")
+    parser.add_argument("--min-rgb-mean", type=float, default=0.0, help="Reject near-black clips whose mean RGB is below this.")
+    parser.add_argument("--min-rgb-std", type=float, default=0.0, help="Reject flat clips whose RGB std is below this.")
     parser.add_argument("--max-resample-attempts", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -96,6 +98,14 @@ def episode_index_from_path(path: Path) -> int:
     if match is None:
         raise ValueError(f"Cannot parse episode index from {path}")
     return int(match.group(1))
+
+
+def episode_key_from_data_path(path: Path) -> tuple[str, int]:
+    return path.parent.name, episode_index_from_path(path)
+
+
+def episode_key_from_video_path(path: Path) -> tuple[str, int]:
+    return path.parent.parent.name, episode_index_from_path(path)
 
 
 def parquet_num_rows(path: Path) -> int:
@@ -142,6 +152,8 @@ class LocalLeRobotClipDataset(Dataset):
         samples_per_episode: int,
         seed: int,
         min_rgb_delta: float,
+        min_rgb_mean: float,
+        min_rgb_std: float,
         max_resample_attempts: int,
     ):
         self.root = root
@@ -150,6 +162,8 @@ class LocalLeRobotClipDataset(Dataset):
         self.frame_offsets = [0, *future_deltas]
         self.rng = random.Random(seed)
         self.min_rgb_delta = min_rgb_delta
+        self.min_rgb_mean = min_rgb_mean
+        self.min_rgb_std = min_rgb_std
         self.max_resample_attempts = max(max_resample_attempts, 1)
         self.info = self._load_info()
         self.video_paths = self._index_video_paths(video_keys)
@@ -164,13 +178,13 @@ class LocalLeRobotClipDataset(Dataset):
             raise FileNotFoundError(info_path)
         return json.loads(info_path.read_text())
 
-    def _index_video_paths(self, video_keys: list[str]) -> dict[str, dict[int, Path]]:
-        result: dict[str, dict[int, Path]] = {}
+    def _index_video_paths(self, video_keys: list[str]) -> dict[str, dict[tuple[str, int], Path]]:
+        result: dict[str, dict[tuple[str, int], Path]] = {}
         for key in video_keys:
             paths = sorted((self.root / "videos").glob(f"chunk-*/*{key}*/episode_*.mp4"))
             if not paths:
                 paths = sorted((self.root / "videos").glob(f"chunk-*/{key}/episode_*.mp4"))
-            mapping = {episode_index_from_path(path): path for path in paths}
+            mapping = {episode_key_from_video_path(path): path for path in paths}
             if not mapping:
                 raise FileNotFoundError(f"No videos found for key={key} under {self.root / 'videos'}")
             result[key] = mapping
@@ -181,12 +195,13 @@ class LocalLeRobotClipDataset(Dataset):
         episodes = []
         for parquet_path in parquet_paths:
             episode_index = episode_index_from_path(parquet_path)
-            if any(episode_index not in self.video_paths[key] for key in self.video_keys):
+            episode_key = episode_key_from_data_path(parquet_path)
+            if any(episode_key not in self.video_paths[key] for key in self.video_keys):
                 continue
             num_rows = parquet_num_rows(parquet_path)
             if num_rows <= max(self.future_deltas):
                 continue
-            episodes.append({"episode_index": episode_index, "num_rows": num_rows, "parquet": parquet_path})
+            episodes.append({"episode_index": episode_index, "episode_key": episode_key, "num_rows": num_rows, "parquet": parquet_path})
             if max_episodes > 0 and len(episodes) >= max_episodes:
                 break
         return episodes
@@ -212,32 +227,47 @@ class LocalLeRobotClipDataset(Dataset):
         delta = (images[:, 1:] - images[:, :1]).abs().mean(dim=(2, 3, 4))
         return float(delta.max())
 
+    @staticmethod
+    def clip_rgb_quality(images: torch.Tensor) -> tuple[float, float]:
+        return float(images.mean()), float(images.std())
+
+    def _passes_rgb_filter(self, sample: dict[str, Any]) -> bool:
+        return (
+            sample["rgb_delta"] >= self.min_rgb_delta
+            and sample["rgb_mean"] >= self.min_rgb_mean
+            and sample["rgb_std"] >= self.min_rgb_std
+        )
+
     def _get_sample(self, index: int) -> dict[str, Any]:
         episode_list_index, start = self.samples[index]
         episode = self.episodes[episode_list_index]
         frame_indices = [start + offset for offset in self.frame_offsets]
         per_view = []
         for key in self.video_keys:
-            frames = read_video_frames(self.video_paths[key][episode["episode_index"]], frame_indices)
+            frames = read_video_frames(self.video_paths[key][episode["episode_key"]], frame_indices)
             per_view.append(frames)
         images = torch.stack(per_view, dim=0)
         rgb_delta = self.clip_rgb_delta(images)
+        rgb_mean, rgb_std = self.clip_rgb_quality(images)
         return {
             "images": images,
             "rgb_delta": rgb_delta,
+            "rgb_mean": rgb_mean,
+            "rgb_std": rgb_std,
             "dataset_name": self.root.name,
             "episode_id": str(episode["episode_index"]),
+            "episode_key": episode["episode_key"],
             "start_index": start,
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         sample = self._get_sample(index)
-        if self.min_rgb_delta <= 0 or sample["rgb_delta"] >= self.min_rgb_delta:
+        if self._passes_rgb_filter(sample):
             return sample
         for _ in range(self.max_resample_attempts - 1):
             new_index = random.randrange(len(self.samples))
             sample = self._get_sample(new_index)
-            if sample["rgb_delta"] >= self.min_rgb_delta:
+            if self._passes_rgb_filter(sample):
                 break
         return sample
 
@@ -246,6 +276,8 @@ def collate_clip_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "images": torch.stack([item["images"] for item in batch], dim=0),
         "rgb_delta": torch.as_tensor([item["rgb_delta"] for item in batch], dtype=torch.float32),
+        "rgb_mean": torch.as_tensor([item["rgb_mean"] for item in batch], dtype=torch.float32),
+        "rgb_std": torch.as_tensor([item["rgb_std"] for item in batch], dtype=torch.float32),
         "dataset_name": [item["dataset_name"] for item in batch],
         "episode_id": [item["episode_id"] for item in batch],
         "start_index": torch.as_tensor([item["start_index"] for item in batch], dtype=torch.long),
@@ -307,6 +339,8 @@ def main() -> None:
         samples_per_episode=args.samples_per_episode,
         seed=args.seed,
         min_rgb_delta=args.min_rgb_delta,
+        min_rgb_mean=args.min_rgb_mean,
+        min_rgb_std=args.min_rgb_std,
         max_resample_attempts=args.max_resample_attempts,
     )
     loader = DataLoader(
@@ -331,7 +365,13 @@ def main() -> None:
             dataset.info.get("fps"),
             video_keys,
         )
-        logging.info("motion filter min_rgb_delta=%.6f max_resample_attempts=%d", args.min_rgb_delta, args.max_resample_attempts)
+        logging.info(
+            "motion filter min_rgb_delta=%.6f min_rgb_mean=%.6f min_rgb_std=%.6f max_resample_attempts=%d",
+            args.min_rgb_delta,
+            args.min_rgb_mean,
+            args.min_rgb_std,
+            args.max_resample_attempts,
+        )
 
     if args.dry_run_loader:
         batch = next(iter(loader))
@@ -341,6 +381,7 @@ def main() -> None:
                 (
                     "dry_run batch images shape=%s dtype=%s min=%.4f max=%.4f "
                     "rgb_delta_shape=%s rgb_delta_mean=%.6f rgb_delta_max=%.6f "
+                    "rgb_mean=%.6f rgb_std=%.6f "
                     "dataset=%s episode=%s start=%s"
                 ),
                 tuple(images.shape),
@@ -350,6 +391,8 @@ def main() -> None:
                 tuple(batch["rgb_delta"].shape),
                 float(batch["rgb_delta"].mean()),
                 float(batch["rgb_delta"].max()),
+                float(batch["rgb_mean"].mean()),
+                float(batch["rgb_std"].mean()),
                 batch["dataset_name"][:4],
                 batch["episode_id"][:4],
                 batch["start_index"][:4].tolist(),
@@ -454,7 +497,8 @@ def main() -> None:
                     "step=%d loss=%.6f recon=%.6f cos=%.6f delta=%.6f kl=%.6f "
                     "obs_mse=%.6f future_mse=%.6f static_future_mse=%.6f "
                     "future_copy_ratio=%.3f pred_d=%.6f gt_d=%.6f d_ratio=%.3f "
-                    "rgb_delta_mean=%.6f rgb_delta_max=%.6f obs_groups=%d grad=%.3f steps/s=%.3f"
+                    "rgb_delta_mean=%.6f rgb_delta_max=%.6f rgb_mean=%.6f rgb_std=%.6f "
+                    "obs_groups=%d grad=%.3f steps/s=%.3f"
                 ),
                 step,
                 float(loss_dict["loss"].detach().cpu()),
@@ -471,6 +515,8 @@ def main() -> None:
                 float(loss_dict["delta_ratio"].detach().cpu()),
                 float(batch["rgb_delta"].mean().cpu()),
                 float(batch["rgb_delta"].max().cpu()),
+                float(batch["rgb_mean"].mean().cpu()),
+                float(batch["rgb_std"].mean().cpu()),
                 observed_groups,
                 float(grad_norm.detach().cpu()),
                 steps_per_sec,
