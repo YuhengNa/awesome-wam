@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-episodes", type=int, default=512)
+    parser.add_argument("--episode-offset", type=int, default=0, help="Skip this many valid episodes before sampling clips.")
     parser.add_argument("--samples-per-episode", type=int, default=64)
     parser.add_argument("--max-batches", type=int, default=200)
     parser.add_argument("--min-rgb-delta", type=float, default=0.0)
@@ -101,6 +102,7 @@ def main() -> None:
         video_keys=video_keys,
         future_deltas=future_deltas,
         max_episodes=args.max_episodes,
+        episode_offset=args.episode_offset,
         samples_per_episode=args.samples_per_episode,
         seed=args.seed,
         min_rgb_delta=args.min_rgb_delta,

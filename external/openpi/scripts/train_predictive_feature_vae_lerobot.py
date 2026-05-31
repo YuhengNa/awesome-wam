@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-episodes", type=int, default=512)
+    parser.add_argument("--episode-offset", type=int, default=0, help="Skip this many valid episodes before sampling clips.")
     parser.add_argument("--samples-per-episode", type=int, default=64)
     parser.add_argument("--dry-run-loader", action="store_true", help="Build dataset and print one batch without loading teachers.")
     parser.add_argument("--overfit-first-batch", action="store_true", help="Reuse the first DataLoader batch for every step.")
@@ -151,6 +152,7 @@ class LocalLeRobotClipDataset(Dataset):
         video_keys: list[str],
         future_deltas: tuple[int, ...],
         max_episodes: int,
+        episode_offset: int,
         samples_per_episode: int,
         seed: int,
         min_rgb_delta: float,
@@ -169,7 +171,7 @@ class LocalLeRobotClipDataset(Dataset):
         self.max_resample_attempts = max(max_resample_attempts, 1)
         self.info = self._load_info()
         self.video_paths = self._index_video_paths(video_keys)
-        self.episodes = self._index_episodes(max_episodes)
+        self.episodes = self._index_episodes(max_episodes, episode_offset)
         self.samples = self._build_samples(samples_per_episode)
         if not self.samples:
             raise ValueError(f"No valid clips found in {root}")
@@ -183,18 +185,28 @@ class LocalLeRobotClipDataset(Dataset):
     def _index_video_paths(self, video_keys: list[str]) -> dict[str, dict[tuple[str, int], Path]]:
         result: dict[str, dict[tuple[str, int], Path]] = {}
         for key in video_keys:
-            paths = sorted((self.root / "videos").glob(f"chunk-*/*{key}*/episode_*.mp4"))
+            paths = sorted((self.root / "videos").glob(f"chunk-*/{key}/episode_*.mp4"))
             if not paths:
-                paths = sorted((self.root / "videos").glob(f"chunk-*/{key}/episode_*.mp4"))
+                paths = sorted((self.root / "videos").glob(f"chunk-*/*{key}*/episode_*.mp4"))
             mapping = {episode_key_from_video_path(path): path for path in paths}
             if not mapping:
                 raise FileNotFoundError(f"No videos found for key={key} under {self.root / 'videos'}")
+            if len(paths) > len(mapping):
+                logging.warning(
+                    "video key %s matched %d files but only %d unique episodes; "
+                    "this usually means the key is ambiguous across camera views. "
+                    "Prefer an explicit key such as observation.images.image_0.",
+                    key,
+                    len(paths),
+                    len(mapping),
+                )
             result[key] = mapping
         return result
 
-    def _index_episodes(self, max_episodes: int) -> list[dict[str, Any]]:
+    def _index_episodes(self, max_episodes: int, episode_offset: int) -> list[dict[str, Any]]:
         parquet_paths = sorted((self.root / "data").glob("chunk-*/episode_*.parquet"))
         episodes = []
+        valid_seen = 0
         for parquet_path in parquet_paths:
             episode_index = episode_index_from_path(parquet_path)
             episode_key = episode_key_from_data_path(parquet_path)
@@ -203,7 +215,11 @@ class LocalLeRobotClipDataset(Dataset):
             num_rows = parquet_num_rows(parquet_path)
             if num_rows <= max(self.future_deltas):
                 continue
+            if valid_seen < episode_offset:
+                valid_seen += 1
+                continue
             episodes.append({"episode_index": episode_index, "episode_key": episode_key, "num_rows": num_rows, "parquet": parquet_path})
+            valid_seen += 1
             if max_episodes > 0 and len(episodes) >= max_episodes:
                 break
         return episodes
@@ -366,6 +382,7 @@ def main() -> None:
         video_keys=video_keys,
         future_deltas=future_deltas,
         max_episodes=args.max_episodes,
+        episode_offset=args.episode_offset,
         samples_per_episode=args.samples_per_episode,
         seed=args.seed,
         min_rgb_delta=args.min_rgb_delta,

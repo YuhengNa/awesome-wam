@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--max-episodes", type=int, default=512)
+    parser.add_argument("--episode-offset", type=int, default=None)
     parser.add_argument("--samples-per-episode", type=int, default=64)
     parser.add_argument("--min-rgb-delta", type=float, default=None)
     parser.add_argument("--min-rgb-mean", type=float, default=None)
@@ -89,6 +90,7 @@ def prepare_model_args(args: argparse.Namespace, checkpoint_args: dict[str, Any]
         ("video_keys", "observation.images.image"),
         ("future_deltas", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"),
         ("observed_groups", 1),
+        ("episode_offset", 0),
         ("min_rgb_delta", 0.0),
         ("min_rgb_mean", 0.0),
         ("min_rgb_std", 0.0),
@@ -178,6 +180,7 @@ def main() -> None:
         video_keys=video_keys,
         future_deltas=future_deltas,
         max_episodes=args.max_episodes,
+        episode_offset=args.episode_offset,
         samples_per_episode=args.samples_per_episode,
         seed=args.seed,
         min_rgb_delta=args.min_rgb_delta,
