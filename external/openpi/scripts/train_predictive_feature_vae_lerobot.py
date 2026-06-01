@@ -74,6 +74,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cosine-weight", type=float, default=0.1)
     parser.add_argument("--delta-weight", type=float, default=0.5)
     parser.add_argument("--future-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--future-weight-ramp",
+        type=float,
+        default=0.0,
+        help="Linearly increase future frame loss weights by this factor from first to last predicted frame.",
+    )
     parser.add_argument("--observed-groups", type=int, default=0)
     parser.add_argument("--min-observed-groups", type=int, default=1)
     parser.add_argument("--feature-normalization", choices=("none", "l2", "token_layer_norm", "channel_standard"), default="none")
@@ -476,6 +482,7 @@ def main() -> None:
         cosine_weight=args.cosine_weight,
         delta_weight=args.delta_weight,
         future_loss_weight=args.future_loss_weight,
+        future_weight_ramp=args.future_weight_ramp,
     )
     model = PredictiveFeatureVAE(model_config).to(device)
     if use_ddp:
@@ -554,11 +561,33 @@ def main() -> None:
             static_future_mse = loss_dict["static_future_mse"].detach()
             future_mse = loss_dict["future_mse"].detach()
             future_copy_ratio = future_mse / static_future_mse.clamp_min(1e-6)
+            future_copy_ratio_by_frame = loss_dict["future_copy_ratio_by_frame"].detach()
+            future_mse_by_frame = loss_dict["future_mse_by_frame"].detach()
+            delta_ratio_by_frame = loss_dict["delta_ratio_by_frame"].detach()
+            if future_copy_ratio_by_frame.numel() > 0:
+                future_ratio_first = float(future_copy_ratio_by_frame[0].cpu())
+                future_ratio_last = float(future_copy_ratio_by_frame[-1].cpu())
+                future_mse_first = float(future_mse_by_frame[0].cpu())
+                future_mse_last = float(future_mse_by_frame[-1].cpu())
+            else:
+                future_ratio_first = 0.0
+                future_ratio_last = 0.0
+                future_mse_first = 0.0
+                future_mse_last = 0.0
+            if delta_ratio_by_frame.numel() > 0:
+                delta_ratio_first = float(delta_ratio_by_frame[0].cpu())
+                delta_ratio_last = float(delta_ratio_by_frame[-1].cpu())
+            else:
+                delta_ratio_first = 0.0
+                delta_ratio_last = 0.0
             logging.info(
                 (
                     "step=%d loss=%.6f recon=%.6f cos=%.6f delta=%.6f kl=%.6f "
                     "obs_mse=%.6f future_mse=%.6f static_future_mse=%.6f "
                     "future_copy_ratio=%.3f pred_d=%.6f gt_d=%.6f d_ratio=%.3f "
+                    "future_ratio_first=%.3f future_ratio_last=%.3f "
+                    "future_mse_first=%.6f future_mse_last=%.6f "
+                    "delta_ratio_first=%.3f delta_ratio_last=%.3f "
                     "rgb_delta_mean=%.6f rgb_delta_max=%.6f rgb_mean=%.6f rgb_std=%.6f "
                     "obs_groups=%d grad=%.3f steps/s=%.3f"
                 ),
@@ -575,6 +604,12 @@ def main() -> None:
                 float(loss_dict["pred_delta_norm"].detach().cpu()),
                 float(loss_dict["target_delta_norm"].detach().cpu()),
                 float(loss_dict["delta_ratio"].detach().cpu()),
+                future_ratio_first,
+                future_ratio_last,
+                future_mse_first,
+                future_mse_last,
+                delta_ratio_first,
+                delta_ratio_last,
                 float(batch["rgb_delta"].mean().cpu()),
                 float(batch["rgb_delta"].max().cpu()),
                 float(batch["rgb_mean"].mean().cpu()),

@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--future-deltas", default=None)
     parser.add_argument("--observed-groups", type=int, default=None)
     parser.add_argument("--num-clips", type=int, default=8)
+    parser.add_argument(
+        "--allow-duplicate-clips",
+        action="store_true",
+        help="Allow repeated (episode_id, start_index) clips in the visualization set.",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--max-episodes", type=int, default=512)
@@ -141,10 +146,18 @@ def sample_metrics(features: torch.Tensor, pred: torch.Tensor, observed_frames: 
     target_delta = features[1:] - features[:-1]
     pred_d = float(pred_delta.float().norm(dim=-1).mean().cpu())
     gt_d = float(target_delta.float().norm(dim=-1).mean().cpu())
-    future_mse = float((pred[observed_frames:] - features[observed_frames:]).float().pow(2).mean().cpu())
+    future_sqerr = (pred[observed_frames:] - features[observed_frames:]).float().pow(2)
+    future_mse_by_frame = future_sqerr.mean(dim=(1, 2))
+    future_mse = float(future_mse_by_frame.mean().cpu())
     static = features[observed_frames - 1 : observed_frames].expand_as(features[observed_frames:])
-    static_mse = float((static - features[observed_frames:]).float().pow(2).mean().cpu())
+    static_sqerr = (static - features[observed_frames:]).float().pow(2)
+    static_mse_by_frame = static_sqerr.mean(dim=(1, 2))
+    static_mse = float(static_mse_by_frame.mean().cpu())
     full_mse = float((pred.float() - features.float()).pow(2).mean().cpu())
+    future_copy_ratio_by_frame = future_mse_by_frame / static_mse_by_frame.clamp_min(1e-6)
+    pred_delta_norm_by_frame = pred_delta.float().norm(dim=-1).mean(dim=1)
+    gt_delta_norm_by_frame = target_delta.float().norm(dim=-1).mean(dim=1)
+    delta_ratio_by_frame = pred_delta_norm_by_frame / gt_delta_norm_by_frame.clamp_min(1e-6)
     return {
         "feature_mse": full_mse,
         "future_mse": future_mse,
@@ -153,7 +166,91 @@ def sample_metrics(features: torch.Tensor, pred: torch.Tensor, observed_frames: 
         "pred_d": pred_d,
         "gt_d": gt_d,
         "d_ratio": pred_d / max(gt_d, 1e-6),
+        "future_mse_by_frame": [float(value.cpu()) for value in future_mse_by_frame],
+        "static_future_mse_by_frame": [float(value.cpu()) for value in static_mse_by_frame],
+        "future_copy_ratio_by_frame": [float(value.cpu()) for value in future_copy_ratio_by_frame],
+        "pred_delta_norm_by_frame": [float(value.cpu()) for value in pred_delta_norm_by_frame],
+        "gt_delta_norm_by_frame": [float(value.cpu()) for value in gt_delta_norm_by_frame],
+        "delta_ratio_by_frame": [float(value.cpu()) for value in delta_ratio_by_frame],
     }
+
+
+def _mean(values: list[float]) -> float:
+    return float(sum(values) / max(len(values), 1))
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return float(ordered[mid])
+    return float(0.5 * (ordered[mid - 1] + ordered[mid]))
+
+
+def _aggregate_scalar(manifest: list[dict[str, Any]], key: str) -> dict[str, float]:
+    values = [float(item[key]) for item in manifest]
+    return {
+        "mean": _mean(values),
+        "median": _median(values),
+        "min": float(min(values)) if values else 0.0,
+        "max": float(max(values)) if values else 0.0,
+    }
+
+
+def _aggregate_vector(manifest: list[dict[str, Any]], key: str) -> dict[str, list[float]]:
+    vectors = [item[key] for item in manifest if item.get(key)]
+    if not vectors:
+        return {"mean": [], "median": [], "min": [], "max": []}
+    width = min(len(vector) for vector in vectors)
+    columns = [[float(vector[i]) for vector in vectors] for i in range(width)]
+    return {
+        "mean": [_mean(column) for column in columns],
+        "median": [_median(column) for column in columns],
+        "min": [float(min(column)) for column in columns],
+        "max": [float(max(column)) for column in columns],
+    }
+
+
+def summarize_manifest(manifest: list[dict[str, Any]], observed_frames: int) -> dict[str, Any]:
+    unique_keys = {(item["episode_id"], item["start_index"]) for item in manifest}
+    ratio_values = [float(item["future_copy_ratio"]) for item in manifest]
+    summary = {
+        "num_clips": len(manifest),
+        "num_unique_episode_start": len(unique_keys),
+        "observed_frames": observed_frames,
+        "copy_better_count": sum(value < 1.0 for value in ratio_values),
+        "copy_better_fraction": _mean([1.0 if value < 1.0 else 0.0 for value in ratio_values]),
+        "strong_copy_better_count": sum(value <= 0.75 for value in ratio_values),
+        "copy_worse_count": sum(value > 1.0 for value in ratio_values),
+        "copy_much_worse_count": sum(value > 1.5 for value in ratio_values),
+        "scalars": {},
+        "by_future_frame": {},
+    }
+    for key in (
+        "feature_mse",
+        "future_mse",
+        "static_future_mse",
+        "future_copy_ratio",
+        "pred_d",
+        "gt_d",
+        "d_ratio",
+        "rgb_delta",
+        "rgb_mean",
+        "rgb_std",
+    ):
+        summary["scalars"][key] = _aggregate_scalar(manifest, key)
+    for key in (
+        "future_mse_by_frame",
+        "static_future_mse_by_frame",
+        "future_copy_ratio_by_frame",
+        "pred_delta_norm_by_frame",
+        "gt_delta_norm_by_frame",
+        "delta_ratio_by_frame",
+    ):
+        summary["by_future_frame"][key] = _aggregate_vector(manifest, key)
+    return summary
 
 
 def main() -> None:
@@ -223,6 +320,7 @@ def main() -> None:
     )
 
     manifest = []
+    seen_clips = set()
     clip_index = 0
     for batch in loader:
         images = batch["images"].to(device, non_blocking=True)
@@ -235,6 +333,10 @@ def main() -> None:
 
         batch_size = images.shape[0]
         for item_idx in range(batch_size):
+            clip_key = (batch["episode_id"][item_idx], int(batch["start_index"][item_idx]))
+            if not args.allow_duplicate_clips and clip_key in seen_clips:
+                continue
+            seen_clips.add(clip_key)
             metrics = sample_metrics(features[item_idx, 0], pred[item_idx, 0], observed_frames)
             filename = f"clip_{clip_index:04d}_ep{batch['episode_id'][item_idx]}_s{int(batch['start_index'][item_idx]):06d}.png"
             pv_utils.save_visualization(
@@ -275,6 +377,10 @@ def main() -> None:
             break
 
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (output_dir / "summary.json").write_text(
+        json.dumps(summarize_manifest(manifest, observed_frames), indent=2),
+        encoding="utf-8",
+    )
     logging.info("Wrote %d visualization clips to %s", len(manifest), output_dir)
 
 

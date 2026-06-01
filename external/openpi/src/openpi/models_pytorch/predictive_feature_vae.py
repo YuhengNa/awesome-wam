@@ -38,6 +38,7 @@ class PredictiveFeatureVAEConfig:
     cosine_weight: float = 0.1
     delta_weight: float = 0.5
     future_loss_weight: float = 1.0
+    future_weight_ramp: float = 0.0
 
 
 class MLP(nn.Module):
@@ -308,7 +309,17 @@ class PredictiveFeatureVAE(nn.Module):
         pred = outputs["pred"]
         frame_weights = torch.ones(features.shape[2], device=features.device, dtype=features.dtype)
         if observed_frames < features.shape[2]:
-            frame_weights[observed_frames:] = self.config.future_loss_weight
+            future_len = features.shape[2] - observed_frames
+            future_weights = torch.full(
+                (future_len,),
+                self.config.future_loss_weight,
+                device=features.device,
+                dtype=features.dtype,
+            )
+            if self.config.future_weight_ramp != 0 and future_len > 1:
+                ramp = torch.linspace(0.0, 1.0, future_len, device=features.device, dtype=features.dtype)
+                future_weights = future_weights * (1.0 + self.config.future_weight_ramp * ramp)
+            frame_weights[observed_frames:] = future_weights
         frame_weights = frame_weights.view(1, 1, -1, 1, 1)
 
         squared_error = (pred - features).pow(2)
@@ -329,17 +340,28 @@ class PredictiveFeatureVAE(nn.Module):
         )
         observed_mse = squared_error[:, :, :observed_frames].mean()
         if observed_frames < features.shape[2]:
-            future_mse = squared_error[:, :, observed_frames:].mean()
+            future_squared_error = squared_error[:, :, observed_frames:]
+            future_mse = future_squared_error.mean()
+            future_mse_by_frame = future_squared_error.mean(dim=(0, 1, 3, 4))
         else:
             future_mse = squared_error.new_zeros(())
+            future_mse_by_frame = squared_error.new_zeros((0,))
         pred_delta_norm = pred_delta.float().norm(dim=-1).mean()
         target_delta_norm = target_delta.float().norm(dim=-1).mean()
         delta_ratio = pred_delta_norm / target_delta_norm.clamp_min(1e-6)
+        pred_delta_norm_by_frame = pred_delta.float().norm(dim=-1).mean(dim=(0, 1, 3))
+        target_delta_norm_by_frame = target_delta.float().norm(dim=-1).mean(dim=(0, 1, 3))
+        delta_ratio_by_frame = pred_delta_norm_by_frame / target_delta_norm_by_frame.clamp_min(1e-6)
         if observed_frames < features.shape[2]:
             static_future = features[:, :, observed_frames - 1 : observed_frames].expand_as(features[:, :, observed_frames:])
-            static_future_mse = F.mse_loss(static_future, features[:, :, observed_frames:])
+            static_squared_error = (static_future - features[:, :, observed_frames:]).pow(2)
+            static_future_mse = static_squared_error.mean()
+            static_future_mse_by_frame = static_squared_error.mean(dim=(0, 1, 3, 4))
+            future_copy_ratio_by_frame = future_mse_by_frame / static_future_mse_by_frame.clamp_min(1e-6)
         else:
             static_future_mse = squared_error.new_zeros(())
+            static_future_mse_by_frame = squared_error.new_zeros((0,))
+            future_copy_ratio_by_frame = squared_error.new_zeros((0,))
         return {
             **outputs,
             "loss": loss,
@@ -349,10 +371,16 @@ class PredictiveFeatureVAE(nn.Module):
             "kl_loss": kl_loss,
             "observed_mse": observed_mse,
             "future_mse": future_mse,
+            "future_mse_by_frame": future_mse_by_frame,
             "pred_delta_norm": pred_delta_norm,
             "target_delta_norm": target_delta_norm,
             "delta_ratio": delta_ratio,
+            "pred_delta_norm_by_frame": pred_delta_norm_by_frame,
+            "target_delta_norm_by_frame": target_delta_norm_by_frame,
+            "delta_ratio_by_frame": delta_ratio_by_frame,
             "static_future_mse": static_future_mse,
+            "static_future_mse_by_frame": static_future_mse_by_frame,
+            "future_copy_ratio_by_frame": future_copy_ratio_by_frame,
             "observed_frames": torch.as_tensor(observed_frames, device=features.device),
             "total_groups": torch.as_tensor(total_groups, device=features.device),
         }
