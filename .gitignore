@@ -26,6 +26,7 @@ external/openpi/scripts/*
 !external/openpi/scripts/train_deltatok_libero.py
 !external/openpi/scripts/inspect_oxe_dataset.py
 !external/openpi/scripts/inspect_lerobot_motion.py
+!external/openpi/scripts/inspect_robot_dataset_views.py
 !external/openpi/scripts/train_lam_libero.py
 !external/openpi/scripts/train_predictive_feature_vae_libero.py
 !external/openpi/scripts/train_predictive_feature_vae_lerobot.py
