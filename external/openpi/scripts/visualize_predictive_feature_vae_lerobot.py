@@ -33,12 +33,16 @@ def parse_int_list(value: str) -> tuple[int, ...]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--lerobot-root", required=True)
+    parser.add_argument("--lerobot-root", default=None)
+    parser.add_argument("--dataset-spec-json", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--teacher", choices=("svg_p", "dinov3_vits16"), default=None)
     parser.add_argument("--dinov3-path", default=None)
     parser.add_argument("--video-keys", default=None)
     parser.add_argument("--future-deltas", default=None)
+    parser.add_argument("--time-sampling-mode", choices=("frame_deltas", "duration_sec"), default=None)
+    parser.add_argument("--clip-duration-sec", type=float, default=None)
+    parser.add_argument("--num-future-frames", type=int, default=None)
     parser.add_argument("--observed-groups", type=int, default=None)
     parser.add_argument("--num-clips", type=int, default=8)
     parser.add_argument(
@@ -51,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=512)
     parser.add_argument("--episode-offset", type=int, default=None)
     parser.add_argument("--samples-per-episode", type=int, default=64)
+    parser.add_argument("--mixture-samples-per-epoch", type=int, default=0)
     parser.add_argument("--min-rgb-delta", type=float, default=None)
     parser.add_argument("--min-rgb-mean", type=float, default=None)
     parser.add_argument("--min-rgb-std", type=float, default=None)
@@ -94,6 +99,10 @@ def prepare_model_args(args: argparse.Namespace, checkpoint_args: dict[str, Any]
         ("dinov3_path", "assets/dinov3-vits16-pretrain-lvd1689m"),
         ("video_keys", "observation.images.image"),
         ("future_deltas", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"),
+        ("dataset_spec_json", None),
+        ("time_sampling_mode", "frame_deltas"),
+        ("clip_duration_sec", None),
+        ("num_future_frames", None),
         ("observed_groups", 1),
         ("episode_offset", 0),
         ("min_rgb_delta", 0.0),
@@ -268,23 +277,13 @@ def main() -> None:
     model, checkpoint_args, checkpoint = load_checkpoint(Path(args.checkpoint), device)
     args = prepare_model_args(args, checkpoint_args)
     future_deltas = parse_int_list(args.future_deltas)
-    video_keys = [key.strip() for key in args.video_keys.split(",") if key.strip()]
-    observed_groups = min(max(int(args.observed_groups), 1), 1 + len(future_deltas) // model.config.temporal_compression)
+    dataset, dataset_summary, num_future_frames, _, video_keys = lerobot_train.build_clip_dataset(
+        args,
+        fallback_future_deltas=future_deltas,
+    )
+    observed_groups = min(max(int(args.observed_groups), 1), 1 + num_future_frames // model.config.temporal_compression)
     observed_frames = 1 + (observed_groups - 1) * model.config.temporal_compression
 
-    dataset = lerobot_train.LocalLeRobotClipDataset(
-        Path(args.lerobot_root),
-        video_keys=video_keys,
-        future_deltas=future_deltas,
-        max_episodes=args.max_episodes,
-        episode_offset=args.episode_offset,
-        samples_per_episode=args.samples_per_episode,
-        seed=args.seed,
-        min_rgb_delta=args.min_rgb_delta,
-        min_rgb_mean=args.min_rgb_mean,
-        min_rgb_std=args.min_rgb_std,
-        max_resample_attempts=args.max_resample_attempts,
-    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -308,15 +307,17 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True))
+    (output_dir / "dataset_summary.json").write_text(json.dumps(dataset_summary, indent=2, sort_keys=True), encoding="utf-8")
     feature_stats = lerobot_train.load_feature_stats(args.feature_stats, device)
     logging.info(
-        "checkpoint=%s step=%s clips=%d teacher=%s observed_groups=%d observed_frames=%d",
+        "checkpoint=%s step=%s clips=%d teacher=%s observed_groups=%d observed_frames=%d sources=%s",
         args.checkpoint,
         checkpoint.get("step"),
         args.num_clips,
         args.teacher,
         observed_groups,
         observed_frames,
+        json.dumps(dataset_summary, sort_keys=True),
     )
 
     manifest = []
@@ -333,7 +334,7 @@ def main() -> None:
 
         batch_size = images.shape[0]
         for item_idx in range(batch_size):
-            clip_key = (batch["episode_id"][item_idx], int(batch["start_index"][item_idx]))
+            clip_key = (batch["episode_uid"][item_idx], int(batch["start_index"][item_idx]))
             if not args.allow_duplicate_clips and clip_key in seen_clips:
                 continue
             seen_clips.add(clip_key)
@@ -352,8 +353,12 @@ def main() -> None:
             manifest.append(
                 {
                     "file": filename,
+                    "source_name": batch["source_name"][item_idx],
+                    "episode_uid": batch["episode_uid"][item_idx],
                     "episode_id": batch["episode_id"][item_idx],
                     "start_index": int(batch["start_index"][item_idx]),
+                    "frame_offsets": batch["frame_offsets"][item_idx],
+                    "time_offsets_sec": batch["time_offsets_sec"][item_idx],
                     "rgb_delta": float(batch["rgb_delta"][item_idx]),
                     "rgb_mean": float(batch["rgb_mean"][item_idx]),
                     "rgb_std": float(batch["rgb_std"][item_idx]),

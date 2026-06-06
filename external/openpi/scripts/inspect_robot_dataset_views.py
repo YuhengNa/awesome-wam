@@ -571,9 +571,10 @@ def flatten_view_rows(audits: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
     fieldnames = sorted({key for row in rows for key in row})
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
@@ -610,9 +611,22 @@ def main() -> None:
     for raw_root in args.root:
         root = Path(raw_root).expanduser().resolve()
         if not root.exists():
-            audits.append({"root": str(root), "error": "Root does not exist."})
+            error = f"Root does not exist or is not mounted on this machine: {root}"
+            print(f"ERROR: {error}")
+            audits.append({"root": str(root), "error": error})
             continue
+        if not root.is_dir():
+            error = f"Root is not a directory: {root}"
+            print(f"ERROR: {error}")
+            audits.append({"root": str(root), "error": error})
+            continue
+        print(f"\nAuditing root: {root}")
         discovery = discover_tree(root, args.max_depth, args.max_files)
+        print(
+            f"discovered_files={discovery['total_files']} "
+            f"lerobot_datasets={len(discovery['lerobot_info_paths'])} "
+            f"generic_video_groups={len(discovery['generic_video_groups'])}"
+        )
         lerobot_datasets = [
             audit_lerobot_dataset(info_path, output_dir=output_dir / safe_name(root.name), args=args, rng=rng)
             for info_path in discovery.pop("lerobot_info_paths")
@@ -665,6 +679,8 @@ def main() -> None:
     print(f"\nreport={report_path}")
     print(f"view_summary={csv_path}")
     print("Role hints are naming-based candidates only; confirm them from contact sheets before training.")
+    if audits and all(audit.get("error") for audit in audits):
+        raise SystemExit("All requested dataset roots were missing or invalid on this machine.")
 
 
 if __name__ == "__main__":

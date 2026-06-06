@@ -43,17 +43,42 @@ def parse_int_list(value: str) -> tuple[int, ...]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lerobot-root", required=True, help="Local LeRobot dataset root, e.g. bridge_orig_lerobot.")
+    parser.add_argument("--lerobot-root", default=None, help="Local LeRobot dataset root, e.g. bridge_orig_lerobot.")
+    parser.add_argument(
+        "--dataset-spec-json",
+        default=None,
+        help=(
+            "Optional JSON list of LeRobot sources for mixed training. "
+            "Each item should contain lerobot_root/root and video_keys."
+        ),
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--teacher", choices=("svg_p", "dinov3_vits16"), default="svg_p")
     parser.add_argument("--dinov3-path", default="assets/dinov3-vits16-pretrain-lvd1689m")
     parser.add_argument("--video-keys", default="observation.images.image")
     parser.add_argument("--future-deltas", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16")
+    parser.add_argument("--time-sampling-mode", choices=("frame_deltas", "duration_sec"), default="frame_deltas")
+    parser.add_argument(
+        "--clip-duration-sec",
+        type=float,
+        default=None,
+        help=(
+            "When --time-sampling-mode duration_sec is used, choose frame offsets "
+            "per dataset so all sources cover this physical horizon."
+        ),
+    )
+    parser.add_argument("--num-future-frames", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-episodes", type=int, default=512)
     parser.add_argument("--episode-offset", type=int, default=0, help="Skip this many valid episodes before sampling clips.")
     parser.add_argument("--samples-per-episode", type=int, default=64)
+    parser.add_argument(
+        "--mixture-samples-per-epoch",
+        type=int,
+        default=0,
+        help="Virtual epoch length for --dataset-spec-json. Defaults to the sum of source sample counts.",
+    )
     parser.add_argument("--dry-run-loader", action="store_true", help="Build dataset and print one batch without loading teachers.")
     parser.add_argument("--overfit-first-batch", action="store_true", help="Reuse the first DataLoader batch for every step.")
     parser.add_argument("--min-rgb-delta", type=float, default=0.0, help="Reject clips whose max mean RGB delta to frame 0 is below this.")
@@ -100,6 +125,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-image-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
+
+
+def read_lerobot_info(root: Path) -> dict[str, Any]:
+    info_path = root / "meta" / "info.json"
+    if not info_path.exists():
+        raise FileNotFoundError(info_path)
+    return json.loads(info_path.read_text())
+
+
+def future_deltas_from_duration(*, fps: float, duration_sec: float, num_future_frames: int) -> tuple[int, ...]:
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}.")
+    if duration_sec <= 0:
+        raise ValueError(f"duration_sec must be positive, got {duration_sec}.")
+    offsets = np.rint(np.linspace(0.0, duration_sec * fps, num_future_frames + 1)).astype(np.int64)
+    offsets[0] = 0
+    if np.any(np.diff(offsets) <= 0):
+        min_duration = num_future_frames / fps
+        raise ValueError(
+            "clip duration is too short to produce unique frame offsets: "
+            f"fps={fps}, duration_sec={duration_sec}, num_future_frames={num_future_frames}. "
+            f"Use at least {min_duration:.3f}s or reduce num_future_frames."
+        )
+    return tuple(int(value) for value in offsets[1:])
+
+
+def resolve_future_deltas_for_source(
+    *,
+    source: dict[str, Any],
+    root: Path,
+    args: argparse.Namespace,
+    fallback_future_deltas: tuple[int, ...],
+) -> tuple[int, ...]:
+    if source.get("future_deltas") is not None:
+        raw = source["future_deltas"]
+        if isinstance(raw, str):
+            return parse_int_list(raw)
+        return tuple(int(item) for item in raw)
+    if args.time_sampling_mode == "frame_deltas":
+        return fallback_future_deltas
+    duration_sec = args.clip_duration_sec
+    if duration_sec is None:
+        raise ValueError("--time-sampling-mode duration_sec requires --clip-duration-sec.")
+    num_future_frames = args.num_future_frames or len(fallback_future_deltas)
+    info = read_lerobot_info(root)
+    fps = float(source.get("fps", info.get("fps", 0)))
+    return future_deltas_from_duration(fps=fps, duration_sec=duration_sec, num_future_frames=num_future_frames)
+
+
+def resize_frames(frames: torch.Tensor, image_size: int | None) -> torch.Tensor:
+    if image_size is None:
+        return frames
+    if frames.shape[-2:] == (image_size, image_size):
+        return frames
+    return F.interpolate(frames, size=(image_size, image_size), mode="bilinear", align_corners=False)
 
 
 def episode_index_from_path(path: Path) -> int:
@@ -165,6 +245,7 @@ class LocalLeRobotClipDataset(Dataset):
         min_rgb_mean: float,
         min_rgb_std: float,
         max_resample_attempts: int,
+        image_size: int | None,
     ):
         self.root = root
         self.video_keys = video_keys
@@ -175,7 +256,9 @@ class LocalLeRobotClipDataset(Dataset):
         self.min_rgb_mean = min_rgb_mean
         self.min_rgb_std = min_rgb_std
         self.max_resample_attempts = max(max_resample_attempts, 1)
+        self.image_size = image_size
         self.info = self._load_info()
+        self.fps = float(self.info.get("fps", 0) or 0)
         self.video_paths = self._index_video_paths(video_keys)
         self.episodes = self._index_episodes(max_episodes, episode_offset)
         self.samples = self._build_samples(samples_per_episode)
@@ -269,6 +352,7 @@ class LocalLeRobotClipDataset(Dataset):
         per_view = []
         for key in self.video_keys:
             frames = read_video_frames(self.video_paths[key][episode["episode_key"]], frame_indices)
+            frames = resize_frames(frames, self.image_size)
             per_view.append(frames)
         images = torch.stack(per_view, dim=0)
         rgb_delta = self.clip_rgb_delta(images)
@@ -279,9 +363,16 @@ class LocalLeRobotClipDataset(Dataset):
             "rgb_mean": rgb_mean,
             "rgb_std": rgb_std,
             "dataset_name": self.root.name,
+            "source_name": self.root.name,
             "episode_id": str(episode["episode_index"]),
+            "episode_uid": f"{self.root.name}:{episode['episode_key'][0]}:{episode['episode_index']:06d}",
             "episode_key": episode["episode_key"],
             "start_index": start,
+            "frame_offsets": tuple(self.frame_offsets),
+            "future_deltas": self.future_deltas,
+            "time_offsets_sec": tuple(float(offset) / self.fps for offset in self.frame_offsets) if self.fps > 0 else None,
+            "fps": self.fps,
+            "video_keys": tuple(self.video_keys),
         }
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -296,6 +387,41 @@ class LocalLeRobotClipDataset(Dataset):
         return sample
 
 
+class MixedLeRobotClipDataset(Dataset):
+    """Balanced random mixture over multiple local LeRobot clip datasets."""
+
+    def __init__(
+        self,
+        sources: list[tuple[str, LocalLeRobotClipDataset, float]],
+        *,
+        samples_per_epoch: int,
+        seed: int,
+    ):
+        if not sources:
+            raise ValueError("MixedLeRobotClipDataset requires at least one source.")
+        self.sources = sources
+        weights = torch.as_tensor([max(float(weight), 0.0) for _, _, weight in sources], dtype=torch.float64)
+        if float(weights.sum()) <= 0:
+            raise ValueError("At least one mixture source must have positive weight.")
+        self.weights = (weights / weights.sum()).tolist()
+        self.samples_per_epoch = samples_per_epoch if samples_per_epoch > 0 else sum(len(dataset) for _, dataset, _ in sources)
+        self.rng = random.Random(seed)
+
+    def __len__(self) -> int:
+        return self.samples_per_epoch
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        del index
+        source_idx = self.rng.choices(range(len(self.sources)), weights=self.weights, k=1)[0]
+        source_name, dataset, _ = self.sources[source_idx]
+        sample = dataset[self.rng.randrange(len(dataset))]
+        sample["source_name"] = source_name
+        sample["dataset_name"] = source_name
+        sample["episode_uid"] = f"{source_name}:{sample['episode_key'][0]}:{int(sample['episode_id']):06d}"
+        sample["future_deltas"] = dataset.future_deltas
+        return sample
+
+
 def collate_clip_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "images": torch.stack([item["images"] for item in batch], dim=0),
@@ -303,9 +429,142 @@ def collate_clip_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "rgb_mean": torch.as_tensor([item["rgb_mean"] for item in batch], dtype=torch.float32),
         "rgb_std": torch.as_tensor([item["rgb_std"] for item in batch], dtype=torch.float32),
         "dataset_name": [item["dataset_name"] for item in batch],
+        "source_name": [item.get("source_name", item["dataset_name"]) for item in batch],
         "episode_id": [item["episode_id"] for item in batch],
+        "episode_uid": [item.get("episode_uid", item["episode_id"]) for item in batch],
         "start_index": torch.as_tensor([item["start_index"] for item in batch], dtype=torch.long),
+        "frame_offsets": [item.get("frame_offsets") for item in batch],
+        "future_deltas": [item.get("future_deltas") for item in batch],
+        "time_offsets_sec": [item.get("time_offsets_sec") for item in batch],
+        "fps": torch.as_tensor([float(item.get("fps") or 0.0) for item in batch], dtype=torch.float32),
     }
+
+
+def parse_video_keys(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [key.strip() for key in value.split(",") if key.strip()]
+    return [str(key).strip() for key in value if str(key).strip()]
+
+
+def load_dataset_spec(path: str) -> list[dict[str, Any]]:
+    spec_path = Path(path)
+    raw = json.loads(spec_path.read_text(encoding="utf-8"))
+    sources = raw.get("sources", raw) if isinstance(raw, dict) else raw
+    if not isinstance(sources, list) or not sources:
+        raise ValueError(f"{path} must contain a non-empty source list or a dict with a 'sources' list.")
+    return [dict(source) for source in sources]
+
+
+def build_clip_dataset(
+    args: argparse.Namespace,
+    *,
+    fallback_future_deltas: tuple[int, ...],
+) -> tuple[Dataset, list[dict[str, Any]], int, int, list[str]]:
+    """Build either a single LeRobot dataset or a weighted multi-source mixture."""
+    if args.dataset_spec_json is None:
+        if args.lerobot_root is None:
+            raise ValueError("Either --lerobot-root or --dataset-spec-json is required.")
+        root = Path(args.lerobot_root)
+        video_keys = parse_video_keys(args.video_keys)
+        source_future_deltas = resolve_future_deltas_for_source(
+            source={},
+            root=root,
+            args=args,
+            fallback_future_deltas=fallback_future_deltas,
+        )
+        dataset = LocalLeRobotClipDataset(
+            root,
+            video_keys=video_keys,
+            future_deltas=source_future_deltas,
+            max_episodes=args.max_episodes,
+            episode_offset=args.episode_offset,
+            samples_per_episode=args.samples_per_episode,
+            seed=args.seed,
+            min_rgb_delta=args.min_rgb_delta,
+            min_rgb_mean=args.min_rgb_mean,
+            min_rgb_std=args.min_rgb_std,
+            max_resample_attempts=args.max_resample_attempts,
+            image_size=args.teacher_image_size,
+        )
+        summary = [
+            {
+                "name": dataset.root.name,
+                "root": str(dataset.root),
+                "video_keys": video_keys,
+                "future_deltas": list(source_future_deltas),
+                "fps": dataset.fps,
+                "episodes": len(dataset.episodes),
+                "samples": len(dataset),
+                "weight": 1.0,
+            }
+        ]
+        return dataset, summary, len(source_future_deltas), len(video_keys), video_keys
+
+    source_specs = load_dataset_spec(args.dataset_spec_json)
+    datasets: list[tuple[str, LocalLeRobotClipDataset, float]] = []
+    summary: list[dict[str, Any]] = []
+    num_future_frames: int | None = None
+    max_views = 0
+    all_video_keys: list[str] = []
+    for idx, source in enumerate(source_specs):
+        root_value = source.get("lerobot_root", source.get("root"))
+        if root_value is None:
+            raise ValueError(f"source {idx} missing lerobot_root/root.")
+        root = Path(str(root_value))
+        source_video_keys = parse_video_keys(source.get("video_keys")) or parse_video_keys(args.video_keys)
+        if not source_video_keys:
+            raise ValueError(f"source {idx} has no video_keys.")
+        source_future_deltas = resolve_future_deltas_for_source(
+            source=source,
+            root=root,
+            args=args,
+            fallback_future_deltas=fallback_future_deltas,
+        )
+        if num_future_frames is None:
+            num_future_frames = len(source_future_deltas)
+        elif len(source_future_deltas) != num_future_frames:
+            raise ValueError("All sources must produce the same number of future frames.")
+        dataset = LocalLeRobotClipDataset(
+            root,
+            video_keys=source_video_keys,
+            future_deltas=source_future_deltas,
+            max_episodes=int(source.get("max_episodes", args.max_episodes)),
+            episode_offset=int(source.get("episode_offset", args.episode_offset)),
+            samples_per_episode=int(source.get("samples_per_episode", args.samples_per_episode)),
+            seed=int(source.get("seed", args.seed + idx)),
+            min_rgb_delta=float(source.get("min_rgb_delta", args.min_rgb_delta)),
+            min_rgb_mean=float(source.get("min_rgb_mean", args.min_rgb_mean)),
+            min_rgb_std=float(source.get("min_rgb_std", args.min_rgb_std)),
+            max_resample_attempts=int(source.get("max_resample_attempts", args.max_resample_attempts)),
+            image_size=args.teacher_image_size,
+        )
+        name = str(source.get("name", root.name))
+        weight = float(source.get("weight", 1.0))
+        datasets.append((name, dataset, weight))
+        max_views = max(max_views, len(source_video_keys))
+        all_video_keys.extend(source_video_keys)
+        summary.append(
+            {
+                "name": name,
+                "root": str(root),
+                "video_keys": source_video_keys,
+                "future_deltas": list(source_future_deltas),
+                "fps": dataset.fps,
+                "episodes": len(dataset.episodes),
+                "samples": len(dataset),
+                "weight": weight,
+            }
+        )
+
+    assert num_future_frames is not None
+    mixture = MixedLeRobotClipDataset(
+        datasets,
+        samples_per_epoch=args.mixture_samples_per_epoch,
+        seed=args.seed,
+    )
+    return mixture, summary, num_future_frames, max_views, sorted(set(all_video_keys))
 
 
 def choose_observed_groups(args: argparse.Namespace, total_groups: int) -> int:
@@ -377,25 +636,17 @@ def main() -> None:
     random.seed(args.seed + local_rank)
 
     future_deltas = parse_int_list(args.future_deltas)
-    if len(future_deltas) % args.temporal_compression != 0:
+    fallback_future_frames = args.num_future_frames or len(future_deltas)
+    if fallback_future_frames % args.temporal_compression != 0:
         raise ValueError("Number of future frames must be divisible by temporal compression.")
-    num_frames = 1 + len(future_deltas)
-    total_groups = 1 + len(future_deltas) // args.temporal_compression
-    video_keys = [key.strip() for key in args.video_keys.split(",") if key.strip()]
-
-    dataset = LocalLeRobotClipDataset(
-        Path(args.lerobot_root),
-        video_keys=video_keys,
-        future_deltas=future_deltas,
-        max_episodes=args.max_episodes,
-        episode_offset=args.episode_offset,
-        samples_per_episode=args.samples_per_episode,
-        seed=args.seed,
-        min_rgb_delta=args.min_rgb_delta,
-        min_rgb_mean=args.min_rgb_mean,
-        min_rgb_std=args.min_rgb_std,
-        max_resample_attempts=args.max_resample_attempts,
+    dataset, dataset_summary, num_future_frames, max_views, video_keys = build_clip_dataset(
+        args,
+        fallback_future_deltas=future_deltas,
     )
+    if num_future_frames % args.temporal_compression != 0:
+        raise ValueError("Number of future frames must be divisible by temporal compression.")
+    num_frames = 1 + num_future_frames
+    total_groups = 1 + num_future_frames // args.temporal_compression
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -409,14 +660,19 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     if lam_utils.is_rank0():
         output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True))
+        (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True), encoding="utf-8")
+        (output_dir / "dataset_summary.json").write_text(
+            json.dumps(dataset_summary, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         logging.info(
-            "LeRobot dataset=%s episodes=%d samples=%d fps=%s video_keys=%s",
-            args.lerobot_root,
-            len(dataset.episodes),
+            "LeRobot dataset sources=%s samples=%d video_keys=%s num_future_frames=%d time_mode=%s clip_duration_sec=%s",
+            json.dumps(dataset_summary, sort_keys=True),
             len(dataset),
-            dataset.info.get("fps"),
             video_keys,
+            num_future_frames,
+            args.time_sampling_mode,
+            args.clip_duration_sec,
         )
         logging.info(
             "motion filter min_rgb_delta=%.6f min_rgb_mean=%.6f min_rgb_std=%.6f max_resample_attempts=%d",
@@ -435,7 +691,7 @@ def main() -> None:
                     "dry_run batch images shape=%s dtype=%s min=%.4f max=%.4f "
                     "rgb_delta_shape=%s rgb_delta_mean=%.6f rgb_delta_max=%.6f "
                     "rgb_mean=%.6f rgb_std=%.6f "
-                    "dataset=%s episode=%s start=%s"
+                    "dataset=%s episode=%s start=%s fps=%s offsets=%s"
                 ),
                 tuple(images.shape),
                 images.dtype,
@@ -449,6 +705,8 @@ def main() -> None:
                 batch["dataset_name"][:4],
                 batch["episode_id"][:4],
                 batch["start_index"][:4].tolist(),
+                batch["fps"][:4].tolist(),
+                batch["frame_offsets"][:4],
             )
         lam_utils.cleanup_ddp()
         return
@@ -476,7 +734,7 @@ def main() -> None:
         num_encoder_layers=args.encoder_layers,
         num_decoder_layers=args.decoder_layers,
         num_heads=args.heads,
-        max_views=max(4, len(video_keys)),
+        max_views=max(4, max_views),
         max_frames=max(32, num_frames),
         kl_weight=args.kl_weight,
         cosine_weight=args.cosine_weight,
@@ -500,7 +758,7 @@ def main() -> None:
             param_count / 1e6,
             args.teacher,
             video_keys,
-            future_deltas,
+            [item["future_deltas"] for item in dataset_summary],
             total_groups,
             output_dir,
         )

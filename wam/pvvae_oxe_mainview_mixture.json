@@ -1,0 +1,18 @@
+{
+  "sources": [
+    {
+      "name": "bridge_image0",
+      "lerobot_root": "/data/user/jhe724/workspace/data/OXE/bridge_orig_lerobot",
+      "video_keys": ["observation.images.image_0"],
+      "fps": 5,
+      "weight": 1.0
+    },
+    {
+      "name": "fractal_image",
+      "lerobot_root": "/data/user/jhe724/workspace/data/OXE/fractal20220817_data_lerobot",
+      "video_keys": ["observation.images.image"],
+      "fps": 3,
+      "weight": 1.0
+    }
+  ]
+}

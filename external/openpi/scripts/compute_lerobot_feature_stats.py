@@ -26,23 +26,33 @@ def parse_int_list(value: str) -> tuple[int, ...]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lerobot-root", required=True)
+    parser.add_argument("--lerobot-root", default=None)
+    parser.add_argument(
+        "--dataset-spec-json",
+        default=None,
+        help="Optional JSON list/dict of LeRobot sources; uses the same format as train_predictive_feature_vae_lerobot.py.",
+    )
     parser.add_argument("--output", required=True, help="Output .pt path.")
     parser.add_argument("--summary-json", default=None)
     parser.add_argument("--teacher", choices=("svg_p", "dinov3_vits16"), default="svg_p")
     parser.add_argument("--dinov3-path", default="assets/dinov3-vits16-pretrain-lvd1689m")
     parser.add_argument("--video-keys", default="observation.images.image")
     parser.add_argument("--future-deltas", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16")
+    parser.add_argument("--time-sampling-mode", choices=("frame_deltas", "duration_sec"), default="frame_deltas")
+    parser.add_argument("--clip-duration-sec", type=float, default=None)
+    parser.add_argument("--num-future-frames", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-episodes", type=int, default=512)
     parser.add_argument("--episode-offset", type=int, default=0, help="Skip this many valid episodes before sampling clips.")
     parser.add_argument("--samples-per-episode", type=int, default=64)
+    parser.add_argument("--mixture-samples-per-epoch", type=int, default=0)
     parser.add_argument("--max-batches", type=int, default=200)
     parser.add_argument("--min-rgb-delta", type=float, default=0.0)
     parser.add_argument("--min-rgb-mean", type=float, default=0.0)
     parser.add_argument("--min-rgb-std", type=float, default=0.0)
     parser.add_argument("--max-resample-attempts", type=int, default=200)
+    parser.add_argument("--temporal-compression", type=int, default=4)
     parser.add_argument("--encoder-microbatch", type=int, default=16)
     parser.add_argument("--precision", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--svg-autoencoder-root", default=None)
@@ -95,21 +105,7 @@ def main() -> None:
     np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     future_deltas = parse_int_list(args.future_deltas)
-    video_keys = [key.strip() for key in args.video_keys.split(",") if key.strip()]
-
-    dataset = lerobot_train.LocalLeRobotClipDataset(
-        Path(args.lerobot_root),
-        video_keys=video_keys,
-        future_deltas=future_deltas,
-        max_episodes=args.max_episodes,
-        episode_offset=args.episode_offset,
-        samples_per_episode=args.samples_per_episode,
-        seed=args.seed,
-        min_rgb_delta=args.min_rgb_delta,
-        min_rgb_mean=args.min_rgb_mean,
-        min_rgb_std=args.min_rgb_std,
-        max_resample_attempts=args.max_resample_attempts,
-    )
+    dataset, dataset_summary, _, _, video_keys = lerobot_train.build_clip_dataset(args, fallback_future_deltas=future_deltas)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -186,6 +182,7 @@ def main() -> None:
             "count": total_count,
             "teacher": args.teacher,
             "future_deltas": future_deltas,
+            "dataset_summary": dataset_summary,
             "video_keys": video_keys,
             "args": vars(args),
         },
@@ -195,6 +192,7 @@ def main() -> None:
     summary: dict[str, Any] = {
         "output": str(output),
         "teacher": args.teacher,
+        "dataset_summary": dataset_summary,
         "feature_dim": int(mean.numel()),
         "feature_tokens": int(total_count),
         "channel_mean_abs_mean": float(mean.abs().mean()),
