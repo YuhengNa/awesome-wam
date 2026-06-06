@@ -208,13 +208,36 @@ def parquet_num_rows(path: Path) -> int:
         return int(len(pd.read_parquet(path, columns=["frame_index"])))
 
 
-def read_video_frames(path: Path, frame_indices: list[int]) -> torch.Tensor:
+def read_video_frames(path: Path, frame_indices: list[int], fps: float | None = None) -> torch.Tensor:
     """Return selected frames as float tensor [T,C,H,W] in [0,1]."""
     try:
         from torchvision.io import read_video  # type: ignore
 
-        video, _, _ = read_video(str(path), pts_unit="sec", output_format="TCHW")
-        frames = video[torch.as_tensor(frame_indices, dtype=torch.long)]
+        first_frame = min(frame_indices)
+        local_indices = frame_indices
+        if fps is not None and fps > 0:
+            # Avoid decoding the whole episode video.  LeRobot videos are
+            # constant-FPS, so a small time window around the requested clip is
+            # enough and greatly reduces DataLoader worker memory.
+            start_pts = max(float(first_frame) / fps - 0.5 / fps, 0.0)
+            end_pts = (float(max(frame_indices)) + 1.5) / fps
+            video, _, _ = read_video(
+                str(path),
+                start_pts=start_pts,
+                end_pts=end_pts,
+                pts_unit="sec",
+                output_format="TCHW",
+            )
+            local_indices = [idx - first_frame for idx in frame_indices]
+        else:
+            video, _, _ = read_video(str(path), pts_unit="sec", output_format="TCHW")
+        index_tensor = torch.as_tensor(local_indices, dtype=torch.long)
+        if video.shape[0] <= int(index_tensor.max()):
+            # Some codecs/timestamp metadata can make segment indexing slightly
+            # off. Fall back to full-video indexing for correctness.
+            video, _, _ = read_video(str(path), pts_unit="sec", output_format="TCHW")
+            index_tensor = torch.as_tensor(frame_indices, dtype=torch.long)
+        frames = video[index_tensor]
         return frames.float().div(255.0).clamp(0.0, 1.0)
     except Exception as first_error:
         try:
@@ -351,7 +374,7 @@ class LocalLeRobotClipDataset(Dataset):
         frame_indices = [start + offset for offset in self.frame_offsets]
         per_view = []
         for key in self.video_keys:
-            frames = read_video_frames(self.video_paths[key][episode["episode_key"]], frame_indices)
+            frames = read_video_frames(self.video_paths[key][episode["episode_key"]], frame_indices, fps=self.fps)
             frames = resize_frames(frames, self.image_size)
             per_view.append(frames)
         images = torch.stack(per_view, dim=0)
