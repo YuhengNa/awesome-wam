@@ -157,7 +157,9 @@ def tensor_for_storage(tensor: torch.Tensor, dtype: str) -> torch.Tensor:
 
 
 def main() -> None:
-    args = parse_args()
+    cli_args = parse_args()
+    user_forced_lerobot_root = cli_args.lerobot_root is not None and cli_args.dataset_spec_json is None
+    args = cli_args
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     import train_lam_libero as lam_utils
@@ -171,6 +173,9 @@ def main() -> None:
 
     model, checkpoint_args, checkpoint = vis_pvvae.load_checkpoint(Path(args.checkpoint), device)
     args = vis_pvvae.prepare_model_args(args, checkpoint_args)
+    if user_forced_lerobot_root:
+        # User explicitly requests a local dataset root; don't inherit mixed-source spec from checkpoint args.
+        args.dataset_spec_json = None
     if args.lerobot_root is None:
         args.lerobot_root = checkpoint_args.get("lerobot_root", checkpoint_args.get("lerobot-root"))
 
@@ -185,15 +190,17 @@ def main() -> None:
     if args.require_num_views > 0 and len(video_keys) != args.require_num_views:
         raise ValueError(f"--require-num-views={args.require_num_views} but dataset video_keys={video_keys}.")
 
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=lerobot_train.collate_clip_batch,
-        worker_init_fn=lerobot_train.seed_worker,
-    )
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": args.batch_size,
+        "shuffle": False,
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "collate_fn": lerobot_train.collate_clip_batch,
+    }
+    if hasattr(lerobot_train, "seed_worker"):
+        loader_kwargs["worker_init_fn"] = lerobot_train.seed_worker
+    loader = DataLoader(**loader_kwargs)
 
     if args.teacher == "svg_p":
         svg_args = argparse.Namespace(**vars(args))
