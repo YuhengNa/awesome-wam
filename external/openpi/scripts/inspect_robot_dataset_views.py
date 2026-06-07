@@ -362,14 +362,24 @@ def discover_tree(root: Path, max_depth: int, max_files: int) -> dict[str, Any]:
     }
 
 
-def lerobot_video_groups(dataset_root: Path) -> dict[str, list[Path]]:
+def lerobot_video_groups(dataset_root: Path, declared_video_keys: Iterable[str] | None = None) -> dict[str, list[Path]]:
     groups: dict[str, list[Path]] = defaultdict(list)
     videos_root = dataset_root / "videos"
     if not videos_root.exists():
         return groups
+    declared = sorted((str(key) for key in (declared_video_keys or ())), key=len, reverse=True)
     for path in videos_root.rglob("*"):
         if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
-            groups[path.parent.name].append(path)
+            try:
+                relative_parts = path.relative_to(videos_root).parts
+            except ValueError:
+                relative_parts = path.parts
+            camera_key = None
+            for key in declared:
+                if key in relative_parts:
+                    camera_key = key
+                    break
+            groups[camera_key or path.parent.name].append(path)
     return groups
 
 
@@ -492,7 +502,7 @@ def audit_lerobot_dataset(
         for key, value in features.items()
         if isinstance(value, dict) and str(value.get("dtype", "")).lower() in {"video", "image"}
     }
-    groups = lerobot_video_groups(dataset_root)
+    groups = lerobot_video_groups(dataset_root, declared_video_features.keys())
     dataset_output = output_dir / safe_name(dataset_root.name)
     views = [
         audit_video_group(
