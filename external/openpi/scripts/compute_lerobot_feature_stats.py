@@ -133,10 +133,13 @@ def main() -> None:
     rgb_delta_values: list[float] = []
     rgb_mean_values: list[float] = []
     rgb_std_values: list[float] = []
+    source_counts: dict[str, int] = {}
 
     for batch_idx, batch in enumerate(loader, start=1):
         if batch_idx > args.max_batches:
             break
+        for source_name in batch.get("source_name", batch.get("dataset_name", [])):
+            source_counts[str(source_name)] = source_counts.get(str(source_name), 0) + 1
         images = batch["images"].to(device, non_blocking=True)
         features = encode_clip(teacher=args.teacher, encoder=encoder, images=images, args=args).float()
         flat = features.reshape(-1, features.shape[-1])
@@ -193,6 +196,7 @@ def main() -> None:
         "output": str(output),
         "teacher": args.teacher,
         "dataset_summary": dataset_summary,
+        "source_counts": source_counts,
         "feature_dim": int(mean.numel()),
         "feature_tokens": int(total_count),
         "channel_mean_abs_mean": float(mean.abs().mean()),

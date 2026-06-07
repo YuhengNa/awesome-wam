@@ -219,6 +219,41 @@ adapter z:   [B,V,5,N,d]
 target:      [B,d,5,H_feat,W_feat_total]
 ```
 
+Current helper script:
+
+```text
+external/openpi/scripts/export_pvvae_latents_lerobot.py
+```
+
+It loads a trained PV-VAE checkpoint, samples the same LeRobot/OXE clips used
+by adapter training, encodes full clips with the frozen teacher and PV-VAE
+encoder, then writes:
+
+```text
+latents.pt:
+  latents    [B,V,5,N,d]
+  wam_target [B,d,5,H_feat,W_feat_total]
+
+summary.json:
+  checkpoint step
+  dataset/source summary
+  latent shape
+  WAM target shape
+  latent norm statistics
+```
+
+For current one-view SVG-P runs, the expected WAM target shape is:
+
+```text
+[B,128,5,16,16]
+```
+
+If later using two views, the expected width-concatenated target is:
+
+```text
+[B,128,5,16,32]
+```
+
 Then run a short FastWAM smoke:
 
 ```text

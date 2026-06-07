@@ -32,6 +32,7 @@ external/openpi/scripts/*
 !external/openpi/scripts/train_predictive_feature_vae_lerobot.py
 !external/openpi/scripts/train_svae_libero.py
 !external/openpi/scripts/compute_lerobot_feature_stats.py
+!external/openpi/scripts/export_pvvae_latents_lerobot.py
 !external/openpi/scripts/visualize_lerobot_motion.py
 !external/openpi/scripts/visualize_predictive_feature_vae_lerobot.py
 !external/openpi/src/

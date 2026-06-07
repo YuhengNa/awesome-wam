@@ -463,6 +463,13 @@ def collate_clip_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_sources(source_names: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for source_name in source_names:
+        counts[str(source_name)] = counts.get(str(source_name), 0) + 1
+    return ",".join(f"{name}:{counts[name]}" for name in sorted(counts))
+
+
 def parse_video_keys(value: Any) -> list[str]:
     if value is None:
         return []
@@ -870,7 +877,7 @@ def main() -> None:
                     "future_mse_first=%.6f future_mse_last=%.6f "
                     "delta_ratio_first=%.3f delta_ratio_last=%.3f "
                     "rgb_delta_mean=%.6f rgb_delta_max=%.6f rgb_mean=%.6f rgb_std=%.6f "
-                    "obs_groups=%d grad=%.3f steps/s=%.3f"
+                    "source_mix=%s obs_groups=%d grad=%.3f steps/s=%.3f"
                 ),
                 step,
                 float(loss_dict["loss"].detach().cpu()),
@@ -895,6 +902,7 @@ def main() -> None:
                 float(batch["rgb_delta"].max().cpu()),
                 float(batch["rgb_mean"].mean().cpu()),
                 float(batch["rgb_std"].mean().cpu()),
+                summarize_sources(batch["source_name"]),
                 observed_groups,
                 float(grad_norm.detach().cpu()),
                 steps_per_sec,
