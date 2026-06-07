@@ -291,6 +291,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         collate_fn=lerobot_train.collate_clip_batch,
+        worker_init_fn=lerobot_train.seed_worker,
     )
 
     if args.teacher == "svg_p":

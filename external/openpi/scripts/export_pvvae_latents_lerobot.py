@@ -41,6 +41,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher", choices=("svg_p", "dinov3_vits16"), default=None)
     parser.add_argument("--dinov3-path", default=None)
     parser.add_argument("--video-keys", default=None)
+    parser.add_argument(
+        "--wam-view-layout",
+        choices=("horizontal", "vertical"),
+        default="horizontal",
+        help=(
+            "How to pack per-view semantic latent grids for WAM. FastWAM's LIBERO/OXE-style "
+            "multi-camera RGB path uses horizontal camera concatenation."
+        ),
+    )
+    parser.add_argument(
+        "--require-num-views",
+        type=int,
+        default=0,
+        help="If positive, fail unless the exported clips have exactly this many camera views.",
+    )
     parser.add_argument("--future-deltas", default=None)
     parser.add_argument("--time-sampling-mode", choices=("frame_deltas", "duration_sec"), default=None)
     parser.add_argument("--clip-duration-sec", type=float, default=None)
@@ -85,15 +100,53 @@ def infer_square_grid(num_tokens: int) -> int:
     return side
 
 
-def latents_to_wam_target(latents: torch.Tensor) -> torch.Tensor:
-    """Convert [B,V,G,N,d] latents into [B,d,G,H,W_total]."""
+def latents_to_wam_target(latents: torch.Tensor, *, view_layout: str) -> torch.Tensor:
+    """Convert [B,V,G,N,d] latents into a FastWAM-style packed spatial layout.
+
+    The original FastWAM RGB dataloader packs camera images spatially before
+    feeding Wan-VAE. This function mirrors that contract in semantic-latent
+    space: each camera owns one H_feat x W_feat grid, and views are concatenated
+    along width or height.
+    """
     if latents.ndim != 5:
         raise ValueError(f"Expected latents [B,V,G,N,d], got {tuple(latents.shape)}.")
     batch_size, num_views, num_groups, num_tokens, latent_dim = latents.shape
     side = infer_square_grid(num_tokens)
     grid = latents.contiguous().view(batch_size, num_views, num_groups, side, side, latent_dim)
-    grid = grid.permute(0, 5, 2, 3, 1, 4).contiguous()
-    return grid.view(batch_size, latent_dim, num_groups, side, num_views * side)
+    if view_layout == "horizontal":
+        grid = grid.permute(0, 5, 2, 3, 1, 4).contiguous()
+        return grid.view(batch_size, latent_dim, num_groups, side, num_views * side)
+    if view_layout == "vertical":
+        grid = grid.permute(0, 5, 2, 1, 3, 4).contiguous()
+        return grid.view(batch_size, latent_dim, num_groups, num_views * side, side)
+    raise ValueError(f"Unsupported view_layout={view_layout!r}.")
+
+
+def validate_wam_target_shape(latents: torch.Tensor, wam_target: torch.Tensor, *, view_layout: str) -> dict[str, int | str]:
+    """Return layout metadata and fail loudly on shape drift."""
+    if latents.ndim != 5 or wam_target.ndim != 5:
+        raise ValueError(f"Expected latents/wam_target to be 5D, got {tuple(latents.shape)} and {tuple(wam_target.shape)}.")
+    batch_size, num_views, num_groups, num_tokens, latent_dim = latents.shape
+    side = infer_square_grid(num_tokens)
+    expected_hw = (side, num_views * side) if view_layout == "horizontal" else (num_views * side, side)
+    expected = (batch_size, latent_dim, num_groups, expected_hw[0], expected_hw[1])
+    if tuple(wam_target.shape) != expected:
+        raise ValueError(
+            "Packed WAM target shape mismatch: "
+            f"expected {expected} from latents {tuple(latents.shape)} with layout={view_layout}, "
+            f"got {tuple(wam_target.shape)}."
+        )
+    return {
+        "view_layout": view_layout,
+        "num_views": num_views,
+        "groups": num_groups,
+        "latent_dim": latent_dim,
+        "tokens_per_view": num_tokens,
+        "feature_grid_h": side,
+        "feature_grid_w": side,
+        "packed_h": expected_hw[0],
+        "packed_w": expected_hw[1],
+    }
 
 
 def tensor_for_storage(tensor: torch.Tensor, dtype: str) -> torch.Tensor:
@@ -129,6 +182,8 @@ def main() -> None:
     total_groups = 1 + num_future_frames // model.config.temporal_compression
     observed_groups = total_groups if int(args.observed_groups) <= 0 else min(int(args.observed_groups), total_groups)
     observed_frames = 1 + (observed_groups - 1) * model.config.temporal_compression
+    if args.require_num_views > 0 and len(video_keys) != args.require_num_views:
+        raise ValueError(f"--require-num-views={args.require_num_views} but dataset video_keys={video_keys}.")
 
     loader = DataLoader(
         dataset,
@@ -137,6 +192,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         collate_fn=lerobot_train.collate_clip_batch,
+        worker_init_fn=lerobot_train.seed_worker,
     )
 
     if args.teacher == "svg_p":
@@ -165,7 +221,10 @@ def main() -> None:
             features = lerobot_train.normalize_feature_clip(features, args.feature_normalization, feature_stats)
             mu, logvar = model.encode_observed(features, observed_groups)
             latents = mu
-            wam_target = latents_to_wam_target(latents)
+            if args.require_num_views > 0 and latents.shape[1] != args.require_num_views:
+                raise ValueError(f"Expected {args.require_num_views} views, got latents shape {tuple(latents.shape)}.")
+            wam_target = latents_to_wam_target(latents, view_layout=args.wam_view_layout)
+            layout_metadata = validate_wam_target_shape(latents, wam_target, view_layout=args.wam_view_layout)
 
         take = min(images.shape[0], args.num_clips - collected)
         latent_batches.append(tensor_for_storage(latents[:take], args.dtype))
@@ -197,6 +256,7 @@ def main() -> None:
 
     latents = torch.cat(latent_batches, dim=0)
     wam_target = torch.cat(wam_batches, dim=0)
+    final_layout_metadata = validate_wam_target_shape(latents, wam_target, view_layout=args.wam_view_layout)
     payload: dict[str, Any] = {
         "latents": latents,
         "wam_target": wam_target,
@@ -205,14 +265,20 @@ def main() -> None:
         "checkpoint_step": checkpoint.get("step"),
         "dataset_summary": dataset_summary,
         "video_keys": video_keys,
+        "view_layout": args.wam_view_layout,
         "feature_normalization": args.feature_normalization,
         "observed_groups": observed_groups,
         "observed_frames": observed_frames,
         "total_groups": total_groups,
+        "layout_metadata": final_layout_metadata,
         "contract": {
             "latents": "[B,V,G,N,d]",
-            "wam_target": "[B,d,G,H_feat,W_feat_total]",
-            "view_layout": "camera views concatenated along W_feat_total",
+            "wam_target": "[B,d,G,H_packed,W_packed]",
+            "view_layout": args.wam_view_layout,
+            "packing_rule": (
+                "horizontal: camera grids are concatenated along W_packed; "
+                "vertical: camera grids are concatenated along H_packed"
+            ),
         },
     }
     if args.save_features:
@@ -227,6 +293,9 @@ def main() -> None:
         "feature_normalization": args.feature_normalization,
         "latent_shape": list(latents.shape),
         "wam_target_shape": list(wam_target.shape),
+        "layout_metadata": final_layout_metadata,
+        "view_layout": args.wam_view_layout,
+        "video_keys": video_keys,
         "latent_norm_mean": float(latents.float().norm(dim=-1).mean()),
         "latent_norm_std": float(latents.float().norm(dim=-1).std()),
         "wam_target_mean": float(wam_target.float().mean()),

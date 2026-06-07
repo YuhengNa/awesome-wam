@@ -470,6 +470,25 @@ def summarize_sources(source_names: list[str]) -> str:
     return ",".join(f"{name}:{counts[name]}" for name in sorted(counts))
 
 
+def reseed_dataset_rng(dataset: Dataset, seed: int) -> None:
+    """Give each DataLoader worker an independent stream for random datasets."""
+    if hasattr(dataset, "rng"):
+        dataset.rng = random.Random(seed)
+    if hasattr(dataset, "sources"):
+        for _, source_dataset, _ in dataset.sources:
+            reseed_dataset_rng(source_dataset, seed)
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        return
+    worker_seed = int(worker_info.seed % (2**32))
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    reseed_dataset_rng(worker_info.dataset, worker_seed)
+
+
 def parse_video_keys(value: Any) -> list[str]:
     if value is None:
         return []
@@ -685,6 +704,7 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
         collate_fn=collate_clip_batch,
+        worker_init_fn=seed_worker,
     )
 
     output_dir = Path(args.output_dir)
