@@ -217,6 +217,33 @@ def parquet_num_rows(path: Path) -> int:
         return int(len(pd.read_parquet(path, columns=["frame_index"])))
 
 
+def estimate_video_num_frames(path: Path, fps: float | None = None) -> int | None:
+    try:
+        import imageio.v3 as iio  # type: ignore
+
+        metadata = iio.immeta(path)
+    except Exception:
+        return None
+    raw_nframes = metadata.get("nframes") or metadata.get("n_frames")
+    if raw_nframes is not None:
+        try:
+            nframes = int(raw_nframes)
+            if nframes > 0:
+                return nframes
+        except (OverflowError, TypeError, ValueError):
+            pass
+    duration = metadata.get("duration")
+    video_fps = metadata.get("fps") or fps
+    try:
+        if duration is not None and video_fps is not None:
+            nframes = int(round(float(duration) * float(video_fps)))
+            if nframes > 0:
+                return nframes
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
 def read_video_frames(path: Path, frame_indices: list[int], fps: float | None = None) -> torch.Tensor:
     """Return selected frames as float tensor [T,C,H,W] in [0,1]."""
     try:
@@ -337,6 +364,21 @@ class LocalLeRobotClipDataset(Dataset):
             if any(episode_key not in self.video_paths[key] for key in self.video_keys):
                 continue
             num_rows = parquet_num_rows(parquet_path)
+            video_frame_counts = [
+                count
+                for key in self.video_keys
+                if (count := estimate_video_num_frames(self.video_paths[key][episode_key], self.fps)) is not None
+            ]
+            if video_frame_counts:
+                video_num_rows = min(video_frame_counts)
+                if 0 < video_num_rows < num_rows:
+                    logging.info(
+                        "Using video frame count for %s: parquet_rows=%d video_frames=%d",
+                        parquet_path,
+                        num_rows,
+                        video_num_rows,
+                    )
+                    num_rows = video_num_rows
             if num_rows <= max(self.future_deltas):
                 continue
             if valid_seen < episode_offset:
