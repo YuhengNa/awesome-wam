@@ -35,6 +35,8 @@ from openpi.models_pytorch.predictive_feature_vae import PredictiveFeatureVAE, P
 
 
 EPISODE_RE = re.compile(r"episode_(\d+)")
+FILE_RE = re.compile(r"file_(\d+)")
+SEQUENCE_DIR_RE = re.compile(r"(?:chunk|task)-\d+")
 
 
 def parse_int_list(value: str) -> tuple[int, ...]:
@@ -183,18 +185,25 @@ def resize_frames(frames: torch.Tensor, image_size: int | None) -> torch.Tensor:
 
 
 def episode_index_from_path(path: Path) -> int:
-    match = EPISODE_RE.search(path.name)
+    match = EPISODE_RE.search(path.name) or FILE_RE.search(path.name)
     if match is None:
         raise ValueError(f"Cannot parse episode index from {path}")
     return int(match.group(1))
 
 
+def sequence_dir_from_path(path: Path) -> str:
+    for part in reversed(path.parts[:-1]):
+        if SEQUENCE_DIR_RE.fullmatch(part):
+            return part
+    return path.parent.name
+
+
 def episode_key_from_data_path(path: Path) -> tuple[str, int]:
-    return path.parent.name, episode_index_from_path(path)
+    return sequence_dir_from_path(path), episode_index_from_path(path)
 
 
 def episode_key_from_video_path(path: Path) -> tuple[str, int]:
-    return path.parent.parent.name, episode_index_from_path(path)
+    return sequence_dir_from_path(path), episode_index_from_path(path)
 
 
 def parquet_num_rows(path: Path) -> int:
@@ -296,13 +305,16 @@ class LocalLeRobotClipDataset(Dataset):
 
     def _index_video_paths(self, video_keys: list[str]) -> dict[str, dict[tuple[str, int], Path]]:
         result: dict[str, dict[tuple[str, int], Path]] = {}
+        videos_root = self.root / "videos"
         for key in video_keys:
-            paths = sorted((self.root / "videos").glob(f"chunk-*/{key}/episode_*.mp4"))
+            paths = sorted(path for path in videos_root.rglob("*.mp4") if key in path.parts)
             if not paths:
-                paths = sorted((self.root / "videos").glob(f"chunk-*/*{key}*/episode_*.mp4"))
+                paths = sorted(videos_root.glob(f"chunk-*/{key}/episode_*.mp4"))
+            if not paths:
+                paths = sorted(videos_root.glob(f"chunk-*/*{key}*/episode_*.mp4"))
             mapping = {episode_key_from_video_path(path): path for path in paths}
             if not mapping:
-                raise FileNotFoundError(f"No videos found for key={key} under {self.root / 'videos'}")
+                raise FileNotFoundError(f"No videos found for key={key} under {videos_root}")
             if len(paths) > len(mapping):
                 logging.warning(
                     "video key %s matched %d files but only %d unique episodes; "
@@ -316,7 +328,7 @@ class LocalLeRobotClipDataset(Dataset):
         return result
 
     def _index_episodes(self, max_episodes: int, episode_offset: int) -> list[dict[str, Any]]:
-        parquet_paths = sorted((self.root / "data").glob("chunk-*/episode_*.parquet"))
+        parquet_paths = sorted((self.root / "data").rglob("*.parquet"))
         episodes = []
         valid_seen = 0
         for parquet_path in parquet_paths:
