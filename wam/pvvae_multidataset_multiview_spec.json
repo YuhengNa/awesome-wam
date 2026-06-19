@@ -1,0 +1,47 @@
+{
+  "sources": [
+    {
+      "name": "oxe_bridge_image0_image1",
+      "lerobot_root": "/data/user/jhe724/workspace/data/OXE/bridge_orig_lerobot",
+      "video_keys": [
+        "observation.images.image_0",
+        "observation.images.image_1"
+      ],
+      "fps": 5,
+      "view_role": "external_plus_secondary",
+      "weight": 1.0
+    },
+    {
+      "name": "oxe_fractal_image",
+      "lerobot_root": "/data/user/jhe724/workspace/data/OXE/fractal20220817_data_lerobot",
+      "video_keys": [
+        "observation.images.image"
+      ],
+      "fps": 3,
+      "view_role": "external_primary",
+      "weight": 1.0
+    },
+    {
+      "name": "behavior_rgb_head_left_right_wrist",
+      "lerobot_root": "/data/user/jhe724/workspace/data/2025-challenge-demos",
+      "video_keys": [
+        "observation.images.rgb.head",
+        "observation.images.rgb.left_wrist",
+        "observation.images.rgb.right_wrist"
+      ],
+      "fps": 30,
+      "view_role": "head_plus_wrist",
+      "weight": 1.0
+    },
+    {
+      "name": "droid_left_external",
+      "lerobot_root": "/data/user/jhe724/workspace/data/droid_success",
+      "video_keys": [
+        "observation.images.left_external"
+      ],
+      "fps": 15,
+      "view_role": "external_primary",
+      "weight": 1.0
+    }
+  ]
+}

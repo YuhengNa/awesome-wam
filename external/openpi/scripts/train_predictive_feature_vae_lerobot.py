@@ -81,6 +81,16 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Virtual epoch length for --dataset-spec-json. Defaults to the sum of source sample counts.",
     )
+    parser.add_argument(
+        "--mixture-source-batch-mode",
+        choices=("sample", "homogeneous"),
+        default="sample",
+        help=(
+            "For mixed datasets, 'sample' picks a source independently for every sample. "
+            "'homogeneous' picks one source per batch, which is required when sources have "
+            "different numbers of camera views."
+        ),
+    )
     parser.add_argument("--dry-run-loader", action="store_true", help="Build dataset and print one batch without loading teachers.")
     parser.add_argument("--overfit-first-batch", action="store_true", help="Reuse the first DataLoader batch for every step.")
     parser.add_argument("--min-rgb-delta", type=float, default=0.0, help="Reject clips whose max mean RGB delta to frame 0 is below this.")
@@ -415,11 +425,21 @@ class LocalLeRobotClipDataset(Dataset):
     def clip_rgb_quality(images: torch.Tensor) -> tuple[float, float]:
         return float(images.mean()), float(images.std())
 
+    @staticmethod
+    def clip_rgb_quality_per_view_min(images: torch.Tensor) -> tuple[float, float]:
+        # images: [V,T,C,H,W].  Multi-view training should reject samples where
+        # any required camera is a black/flat placeholder.
+        per_view_mean = images.mean(dim=(1, 2, 3, 4))
+        per_view_std = images.std(dim=(1, 2, 3, 4))
+        return float(per_view_mean.min()), float(per_view_std.min())
+
     def _passes_rgb_filter(self, sample: dict[str, Any]) -> bool:
         return (
             sample["rgb_delta"] >= self.min_rgb_delta
             and sample["rgb_mean"] >= self.min_rgb_mean
             and sample["rgb_std"] >= self.min_rgb_std
+            and sample["rgb_mean_per_view_min"] >= self.min_rgb_mean
+            and sample["rgb_std_per_view_min"] >= self.min_rgb_std
         )
 
     def _get_sample(self, index: int) -> dict[str, Any]:
@@ -434,11 +454,14 @@ class LocalLeRobotClipDataset(Dataset):
         images = torch.stack(per_view, dim=0)
         rgb_delta = self.clip_rgb_delta(images)
         rgb_mean, rgb_std = self.clip_rgb_quality(images)
+        rgb_mean_per_view_min, rgb_std_per_view_min = self.clip_rgb_quality_per_view_min(images)
         return {
             "images": images,
             "rgb_delta": rgb_delta,
             "rgb_mean": rgb_mean,
             "rgb_std": rgb_std,
+            "rgb_mean_per_view_min": rgb_mean_per_view_min,
+            "rgb_std_per_view_min": rgb_std_per_view_min,
             "dataset_name": self.root.name,
             "source_name": self.root.name,
             "episode_id": str(episode["episode_index"]),
@@ -473,6 +496,7 @@ class MixedLeRobotClipDataset(Dataset):
         *,
         samples_per_epoch: int,
         seed: int,
+        source_batch_size: int = 0,
     ):
         if not sources:
             raise ValueError("MixedLeRobotClipDataset requires at least one source.")
@@ -483,13 +507,21 @@ class MixedLeRobotClipDataset(Dataset):
         self.weights = (weights / weights.sum()).tolist()
         self.samples_per_epoch = samples_per_epoch if samples_per_epoch > 0 else sum(len(dataset) for _, dataset, _ in sources)
         self.rng = random.Random(seed)
+        self.source_batch_size = int(source_batch_size)
+        self.block_sources: list[int] = []
+        if self.source_batch_size > 0:
+            num_blocks = max(1, (self.samples_per_epoch + self.source_batch_size - 1) // self.source_batch_size)
+            self.block_sources = self.rng.choices(range(len(self.sources)), weights=self.weights, k=num_blocks)
 
     def __len__(self) -> int:
         return self.samples_per_epoch
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        del index
-        source_idx = self.rng.choices(range(len(self.sources)), weights=self.weights, k=1)[0]
+        if self.source_batch_size > 0:
+            block_index = min(index // self.source_batch_size, len(self.block_sources) - 1)
+            source_idx = self.block_sources[block_index]
+        else:
+            source_idx = self.rng.choices(range(len(self.sources)), weights=self.weights, k=1)[0]
         source_name, dataset, _ = self.sources[source_idx]
         sample = dataset[self.rng.randrange(len(dataset))]
         sample["source_name"] = source_name
@@ -505,6 +537,8 @@ def collate_clip_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "rgb_delta": torch.as_tensor([item["rgb_delta"] for item in batch], dtype=torch.float32),
         "rgb_mean": torch.as_tensor([item["rgb_mean"] for item in batch], dtype=torch.float32),
         "rgb_std": torch.as_tensor([item["rgb_std"] for item in batch], dtype=torch.float32),
+        "rgb_mean_per_view_min": torch.as_tensor([item.get("rgb_mean_per_view_min", item["rgb_mean"]) for item in batch], dtype=torch.float32),
+        "rgb_std_per_view_min": torch.as_tensor([item.get("rgb_std_per_view_min", item["rgb_std"]) for item in batch], dtype=torch.float32),
         "dataset_name": [item["dataset_name"] for item in batch],
         "source_name": [item.get("source_name", item["dataset_name"]) for item in batch],
         "episode_id": [item["episode_id"] for item in batch],
@@ -666,6 +700,7 @@ def build_clip_dataset(
         datasets,
         samples_per_epoch=args.mixture_samples_per_epoch,
         seed=args.seed,
+        source_batch_size=args.batch_size if getattr(args, "mixture_source_batch_mode", "sample") == "homogeneous" else 0,
     )
     return mixture, summary, num_future_frames, max_views, sorted(set(all_video_keys))
 
@@ -753,7 +788,7 @@ def main() -> None:
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=not (args.dataset_spec_json is not None and args.mixture_source_batch_mode == "homogeneous"),
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,

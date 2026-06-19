@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-offset", type=int, default=0)
     parser.add_argument("--samples-per-episode", type=int, default=8)
     parser.add_argument("--mixture-samples-per-epoch", type=int, default=0)
+    parser.add_argument(
+        "--mixture-source-batch-mode",
+        choices=("sample", "homogeneous"),
+        default="sample",
+        help="Use 'homogeneous' when mixed sources have different numbers of camera views.",
+    )
     parser.add_argument("--min-rgb-delta", type=float, default=0.0)
     parser.add_argument("--min-rgb-mean", type=float, default=0.0)
     parser.add_argument("--min-rgb-std", type=float, default=0.0)
